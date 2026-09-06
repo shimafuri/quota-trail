@@ -1,0 +1,18 @@
+# 一時ファイル・要確認事項・会話ログ（コミット対象外）
+tmp/
+
+# 依存関係・ビルド成果物
+node_modules/
+dist/
+
+# 環境変数・認証情報
+.env
+.env.local
+
+# ログ
+*.log
+logs/
+
+# OS / エディタ
+Thumbs.db
+.DS_Store
