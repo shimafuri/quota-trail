@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>quota-trail</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="page-header">
+      <div class="page-header-left">
+        <h1>quota-trail</h1>
+        <span class="last-fetch" id="lastFetch">最終取得 —</span>
+      </div>
+      <div class="current-values" id="currentValues"></div>
+    </header>
+
+    <main class="grid" id="grid"></main>
+
+    <footer class="page-footer">
+      <span id="footerInfo">読み込み中…</span>
+      <span id="footerNote" class="footer-note"></span>
+    </footer>
+
+    <script type="module" src="./app.mjs"></script>
+  </body>
+</html>

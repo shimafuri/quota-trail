@@ -1,0 +1,45 @@
+{
+  "name": "quota-trail",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Claude Code / Codex CLI の 5h・Weekly limit 使用率を記録して可視化する Windows 常駐アプリ",
+  "type": "module",
+  "main": "src/main/index.mjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test tests/",
+    "rebuild": "electron-rebuild -f -w better-sqlite3",
+    "postinstall": "node scripts/prepare-native.mjs",
+    "make-icon": "node scripts/make-icon.mjs",
+    "build": "electron-builder --win portable nsis"
+  },
+  "build": {
+    "appId": "io.github.shimafuri.quota-trail",
+    "productName": "quota-trail",
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "portable",
+        "nsis"
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.4.1"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.7.2",
+    "electron": "^38.2.0",
+    "electron-builder": "^26.0.12"
+  }
+}
