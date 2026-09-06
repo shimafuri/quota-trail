@@ -40,4 +40,5 @@
 
 | id | title | status | areas |
 |---|---|---|---|
-| （まだ無い） | | | |
+| [H-001](H-001-passive-codex-rollout-source.md) | Codex の rollout の rate_limits を副次データ源にする | evaluated | design（データ取得） |
+| [H-002](H-002-no-idle-pause.md) | idle / ロック中でもポーリングを止めない | adopted | design（スケジューラ） |
