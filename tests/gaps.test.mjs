@@ -153,6 +153,18 @@ test('(d) to が now より先でも欠測は now までで止まる', () => {
   assert.deepEqual(gaps, [{ from: T0 + 3 * MIN, to: T0 + 40 * MIN }]);
 });
 
+test('(d) to が now より先でも、最後の点が新しければ未来側に欠測は出ない（無制限パン対応）', () => {
+  // 発注者指示 2026-09-08: パン/ズームの範囲上限を撤廃したため、to が now よりずっと
+  // 先（未来）になりうる。最後の点が新しければ、now より先の未来部分は灰色にならない。
+  const samples = [ok(0), ok(3), ok(6)];
+  const gaps = computeGaps(samples, {
+    from: T0,
+    to: T0 + 365 * 24 * 60 * MIN, // 1年先まで表示
+    now: T0 + 6 * MIN, // 最後の点と同時刻 = 新しい
+  });
+  assert.deepEqual(gaps, []);
+});
+
 test('サンプルが 0 件なら範囲全体（now まで）が欠測', () => {
   const gaps = computeGaps([], { from: T0, to: T0 + 60 * MIN, now: T0 + 45 * MIN });
   assert.deepEqual(gaps, [{ from: T0, to: T0 + 45 * MIN }]);

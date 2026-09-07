@@ -31,6 +31,8 @@ export const TIME_STEPS = Object.freeze([
   7 * DAY,
   14 * DAY,
   30 * DAY,
+  90 * DAY,
+  365 * DAY,
 ]);
 
 /**
@@ -155,7 +157,8 @@ function pad2(n) {
 /**
  * 目盛りラベルの文字列。
  * - ステップ < 1d: `HH:mm`（日付が変わる最初の目盛りは `M/D HH:mm`）
- * - ステップ >= 1d: `M/D`
+ * - ステップ >= 1d かつ < 90d: `M/D`
+ * - ステップ >= 90d: `YYYY/M/D`
  *
  * @param {number} t epoch ms
  * @param {number} stepMs
@@ -164,6 +167,7 @@ function pad2(n) {
  */
 export function formatTickLabel(t, stepMs, prevTick = null) {
   const d = new Date(t);
+  if (stepMs >= 90 * DAY) return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
   if (stepMs >= DAY) return `${d.getMonth() + 1}/${d.getDate()}`;
   const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
   const newDay =

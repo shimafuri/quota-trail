@@ -12,8 +12,7 @@ import { drawChart, xToTime, nearestSample } from './chart.mjs';
 /** @typedef {import('./theme.mjs').SeriesKey} SeriesKey */
 
 const STORAGE_KEY = 'quota-trail.ui.v1';
-const MIN_RANGE_MS = 30 * 60 * 1000; // 30 分
-const MAX_RANGE_MS = 90 * 24 * 60 * 60 * 1000; // 90 日
+const MIN_RANGE_MS = 60 * 1000; // 1 分（技術的下限。ゼロ幅レンジの回避のみが目的）
 const GAP_FACTOR = 2.5;
 const FOLLOW_INTERVAL_MS = 60_000;
 const FETCH_DEBOUNCE_MS = 150;
@@ -129,10 +128,8 @@ function currentRange() {
  * @param {number} to
  */
 function setCustomRange(from, to) {
-  let span = Math.max(MIN_RANGE_MS, Math.min(MAX_RANGE_MS, to - from));
-  let t = from + span;
-  const maxTo = Date.now() + span * 0.05;
-  if (t > maxTo) t = maxTo;
+  const span = Math.max(MIN_RANGE_MS, to - from);
+  const t = from + span;
   state.custom = { from: t - span, to: t };
   state.period = 'custom';
   for (const p of panels) p.periodSel.value = 'custom';
@@ -347,7 +344,7 @@ function attachInteractions(panel) {
       const { from, to } = currentRange();
       const anchor = xToTime(mx, from, to, rect);
       const factor = ev.deltaY < 0 ? 0.8 : 1.25;
-      const span = Math.max(MIN_RANGE_MS, Math.min(MAX_RANGE_MS, (to - from) * factor));
+      const span = Math.max(MIN_RANGE_MS, (to - from) * factor);
       const ratio = (anchor - from) / (to - from);
       const nf = anchor - ratio * span;
       setCustomRange(nf, nf + span);

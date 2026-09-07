@@ -60,11 +60,23 @@ test('pickTimeStep: 選ばれたステップは必ず >= minPx、ひとつ下の
 test('pickTimeStep: 最小候補・最大候補の端', () => {
   // 非常に短い範囲では最小候補（1分）
   assert.equal(pickTimeStep(5 * MIN, 1900), MIN);
-  // 非常に長い範囲では最大候補（30日）で頭打ち
-  assert.equal(pickTimeStep(3650 * DAY, 300), 30 * DAY);
+  // 非常に長い範囲では最大候補（365日）で頭打ち
+  assert.equal(pickTimeStep(3650 * DAY, 300), 365 * DAY);
   // 不正入力でも落ちない
   assert.equal(pickTimeStep(0, 300), MIN);
-  assert.equal(pickTimeStep(DAY, 0), 30 * DAY);
+  assert.equal(pickTimeStep(DAY, 0), 365 * DAY);
+});
+
+test('pickTimeStep: 無制限パン対応（発注者指示 2026-09-08）で追加した 90d/365d 候補', () => {
+  // 180d を 150px で表示 → 必要ステップ 60d → 候補の最小は 90d
+  assert.equal(pickTimeStep(180 * DAY, 150), 90 * DAY);
+  // 800d を 200px で表示 → 必要ステップ 200d → 候補の最小は 365d
+  assert.equal(pickTimeStep(800 * DAY, 200), 365 * DAY);
+  // 2年 (730d) を 1000px で表示 → 目盛り間隔 >= 50px を満たす最小候補（90d）
+  const step = pickTimeStep(730 * DAY, 1000);
+  const px = (step / (730 * DAY)) * 1000;
+  assert.ok(px >= 50, `${px}px < 50px`);
+  assert.equal(step, 90 * DAY);
 });
 
 test('timeTicks: 1時間ステップはローカルの毎時 0 分に揃う', () => {
@@ -164,6 +176,21 @@ test('formatTickLabel: ステップに応じた書式', () => {
   assert.equal(formatTickLabel(b, HOUR, a), '09:05');
   assert.equal(formatTickLabel(c, HOUR, b), '9/8 00:00'); // 日付が変わる目盛り
   assert.equal(formatTickLabel(c, DAY, b), '9/8');
+  // 90d 以上は YYYY/M/D（無制限パンで年をまたぐ表示になりうるため）
+  assert.equal(formatTickLabel(c, 90 * DAY, b), '2026/9/8');
+  assert.equal(formatTickLabel(c, 365 * DAY, b), '2026/9/8');
+});
+
+test('timeTicks: 90d ステップもローカル 0:00 に揃う', () => {
+  const from = new Date(2026, 0, 1, 0, 0).getTime();
+  const to = new Date(2027, 0, 1, 0, 0).getTime();
+  const ticks = timeTicks(from, to, 90 * DAY);
+  assert.ok(ticks.length >= 4);
+  for (const t of ticks) {
+    const d = new Date(t);
+    assert.equal(d.getHours(), 0);
+    assert.equal(d.getMinutes(), 0);
+  }
 });
 
 test('formatRemaining: 区間ごとの書式', () => {

@@ -158,6 +158,7 @@ export function drawChart(canvas, opts) {
 
   drawYAxis(ctx, r);
   drawGaps(ctx, r, opts.gaps || [], from, to);
+  drawNowLine(ctx, r, opts.now, from, to);
   drawXAxis(ctx, r, cssW, from, to);
   drawResets(ctx, r, opts.samples || [], from, to, opts.color);
   drawSeries(ctx, r, opts, from, to);
@@ -211,6 +212,47 @@ function drawGaps(ctx, r, gaps, from, to) {
     ctx.fillStyle = COLORS.gapBar;
     ctx.fillRect(x0, r.y, w, GAP_BAR_H);
   }
+  ctx.restore();
+}
+
+/**
+ * 表示範囲を未来側へパンして `now` が範囲内に入ったとき、現在時刻を示す薄い灰色の
+ * 縦破線と「現在」ラベルを描く（発注者指示 2026-09-08: パン/ズームは無制限のため、
+ * 未来を見ているときに現在地がわかるようにする）。
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {Rect} r
+ * @param {number} now
+ * @param {number} from
+ * @param {number} to
+ */
+function drawNowLine(ctx, r, now, from, to) {
+  if (!Number.isFinite(now) || now <= from || now >= to) return;
+  const x = Math.round(timeToX(now, from, to, r)) + 0.5;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(r.x, r.y, r.w, r.h);
+  ctx.clip();
+  ctx.strokeStyle = COLORS.axisLabel;
+  ctx.globalAlpha = 0.6;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 3]);
+  ctx.beginPath();
+  ctx.moveTo(x, r.y);
+  ctx.lineTo(x, r.y + r.h);
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  ctx.globalAlpha = 0.6;
+  ctx.fillStyle = COLORS.axisLabel;
+  ctx.font = FONTS.axis;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  let lx = x;
+  const w = ctx.measureText('現在').width;
+  if (lx - w / 2 < r.x) lx = r.x + w / 2;
+  if (lx + w / 2 > r.x + r.w) lx = r.x + r.w - w / 2;
+  ctx.fillText('現在', lx, r.y + 2);
   ctx.restore();
 }
 
