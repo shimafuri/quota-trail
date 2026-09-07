@@ -13,6 +13,7 @@ import {
   formatClockLabel,
   formatRemaining,
 } from '/shared/ticks.mjs';
+import { pastResets } from '/shared/resets.mjs';
 import { COLORS, FONTS } from './theme.mjs';
 
 /** @typedef {import('/shared/gaps.mjs').Sample} Sample */
@@ -160,7 +161,7 @@ export function drawChart(canvas, opts) {
   drawXAxis(ctx, r, cssW, from, to);
   drawResets(ctx, r, opts.samples || [], from, to, opts.color);
   drawSeries(ctx, r, opts, from, to);
-  drawNextReset(ctx, r, opts.nextResetAt ?? null, from, to, opts.now, opts.color);
+  drawNextReset(ctx, r, opts.nextResetAt ?? null, from, to, opts.now, opts.color, opts.samples || [], opts.mode);
   drawFrame(ctx, r);
   drawLegend(ctx, cssW, cssH, lines, legendItems);
   if (opts.hover) drawTooltip(ctx, r, cssW, cssH, opts, from, to);
@@ -262,7 +263,7 @@ function drawFrame(ctx, r) {
 }
 
 /**
- * `resetsAt` が変わった位置に破線の縦線を引く。
+ * `pastResets`（`shared/resets.mjs`）が検出した実際のリセット時刻に破線の縦線を引く。
  * @param {CanvasRenderingContext2D} ctx
  * @param {Rect} r
  * @param {Sample[]} samples
@@ -270,11 +271,9 @@ function drawFrame(ctx, r) {
  * @param {number} to
  * @param {string} color
  */
-const RESET_JITTER_MS = 60_000;
-
 function drawResets(ctx, r, samples, from, to, color) {
-  const oks = samples.filter((s) => s.status === 'ok');
-  if (oks.length < 2) return;
+  const times = pastResets(samples);
+  if (!times.length) return;
   ctx.save();
   ctx.beginPath();
   ctx.rect(r.x, r.y, r.w, r.h);
@@ -285,14 +284,7 @@ function drawResets(ctx, r, samples, from, to, color) {
   ctx.setLineDash([4, 4]);
   // 30日表示などでリセット線が密集して読めなくなるのを避ける（最低 6px 間隔）
   let lastX = -Infinity;
-  for (let i = 1; i < oks.length; i++) {
-    const a = oks[i - 1];
-    const b = oks[i];
-    // API の resetsAt は秒未満〜数秒ゆらぐことがあるので、許容幅未満の差はリセットと見なさない
-    if (a.resetsAt == null || b.resetsAt == null || Math.abs(a.resetsAt - b.resetsAt) < RESET_JITTER_MS) continue;
-    // 実際のリセット時刻（前の点の resetsAt）が 2 点の間にあればそこ、無ければ後の点の時刻
-    const t =
-      a.resetsAt > a.observedAt && a.resetsAt <= b.observedAt ? a.resetsAt : b.observedAt;
+  for (const t of times) {
     if (t < from || t > to) continue;
     const x = Math.round(timeToX(t, from, to, r)) + 0.5;
     if (x - lastX < 6) continue;
@@ -306,10 +298,25 @@ function drawResets(ctx, r, samples, from, to, color) {
 }
 
 /**
+ * 表示中の（範囲外の前後 1 点を含みうる）サンプルのうち、一番新しい ok 点の usedPercent。
+ * 無ければ null。
+ * @param {Sample[]} samples
+ * @returns {number|null}
+ */
+function newestOkUsedPercent(samples) {
+  for (let i = samples.length - 1; i >= 0; i--) {
+    const s = samples[i];
+    if (s.status === 'ok' && s.usedPercent != null) return s.usedPercent;
+  }
+  return null;
+}
+
+/**
  * 「次回リセット予定」マーカーを描く（Chrome DevTools Performance パネルの
- * Nav/FCP/DCL タグ風）。プロット上部から下部までの縦線 + プロット下端に重なる
- * 塗りつぶしタグ。表示範囲より先（右）にあるのが通常ケース（24h/7d/30d は
- * `to = now` のため）で、その場合は右端に固定して残り時間を添える。
+ * Nav/FCP/DCL タグ風）。プロット上部から下部までの縦線 + 塗りつぶしタグ（上下は
+ * `drawTag` が衝突の少ない側を選ぶ）。表示範囲より先（右）にあるのが通常ケース
+ * （24h/7d/30d は `to = now` のため）で、その場合は右端に固定して残り時間を添える。
+ * 最新 ok サンプルの使用率が 0% のときは（リセットする対象が無いので）描かない。
  *
  * @param {CanvasRenderingContext2D} ctx
  * @param {Rect} r
@@ -318,9 +325,12 @@ function drawResets(ctx, r, samples, from, to, color) {
  * @param {number} to
  * @param {number} now
  * @param {string} color 系列色
+ * @param {Sample[]} samples
+ * @param {'line'|'bar'} mode
  */
-function drawNextReset(ctx, r, nextResetAt, from, to, now, color) {
+function drawNextReset(ctx, r, nextResetAt, from, to, now, color, samples, mode) {
   if (nextResetAt == null || !Number.isFinite(nextResetAt) || nextResetAt < from) return;
+  if (newestOkUsedPercent(samples) === 0) return;
 
   const already = nextResetAt < now;
   const drawColor = already ? COLORS.gapBar : color;
@@ -346,40 +356,110 @@ function drawNextReset(ctx, r, nextResetAt, from, to, now, color) {
     ctx.globalAlpha = 1;
 
     const text = `${prefix} ${clock}`;
-    drawTag(ctx, r, { anchorX: x, align: 'left', arrow: false, text, color: drawColor });
+    drawTag(ctx, r, {
+      anchorX: x,
+      align: 'left',
+      arrow: false,
+      text,
+      color: drawColor,
+      samples,
+      mode,
+      from,
+      to,
+    });
   } else {
     // 表示範囲より先: プロット右端に固定し、残り時間を添える
     const text = already
       ? `${prefix} ${clock}`
       : `${prefix} ${clock}（あと ${formatRemaining(nextResetAt - now)}）`;
-    drawTag(ctx, r, { anchorX: r.x + r.w, align: 'right', arrow: !already, text, color: drawColor });
+    drawTag(ctx, r, {
+      anchorX: r.x + r.w,
+      align: 'right',
+      arrow: !already,
+      text,
+      color: drawColor,
+      samples,
+      mode,
+      from,
+      to,
+    });
   }
 
   ctx.restore();
 }
 
 /**
- * DevTools 風のタグ（角丸の塗りつぶし矩形 + 白い太字テキスト）をプロット下端に描く。
+ * タグ候補位置（プロット下端 or 上端）それぞれについて、データ点との「衝突」数を数える。
+ * 折れ線モードは点の y がタグ矩形（3px 拡張）に入れば衝突。棒グラフモードは常に 0% から
+ * 生えるため下端タグには常に衝突し、上端タグには y が矩形に入る（＝値が非常に高い）ときだけ衝突する。
+ *
+ * @param {Sample[]} samples
+ * @param {'line'|'bar'} mode
+ * @param {number} from
+ * @param {number} to
+ * @param {Rect} r
+ * @param {number} top タグ候補の上端 y
+ * @param {boolean} isBottom 下端候補（棒グラフで常に衝突する側）かどうか
+ * @param {number} left タグの左端 x
+ * @param {number} w タグの幅
+ * @returns {number}
+ */
+function tagCollisions(samples, mode, from, to, r, top, isBottom, left, w) {
+  const xLo = left - 2;
+  const xHi = left + w + 2;
+  const yLo = top - 3;
+  const yHi = top + TAG_H + 3;
+  let n = 0;
+  for (const s of samples) {
+    if (s.status !== 'ok' || s.usedPercent == null) continue;
+    const x = timeToX(s.observedAt, from, to, r);
+    if (x < xLo || x > xHi) continue;
+    if (mode === 'bar' && isBottom) {
+      n++;
+      continue;
+    }
+    const y = valueToY(s.usedPercent, r);
+    if (y >= yLo && y <= yHi) n++;
+  }
+  return n;
+}
+
+/**
+ * DevTools 風のタグ（角丸の塗りつぶし矩形 + 白いテキスト、白い外枠）を描く。
  * `align:'left'` は `anchorX` を左端にし、右端がプロットをはみ出すなら右端を
  * `anchorX` に付け替える。`align:'right'` は常に `anchorX` を右端にする。
+ * 上下位置は `tagCollisions` の結果が少ない側を選ぶ（同数ならプロット下端）。
  *
  * @param {CanvasRenderingContext2D} ctx
  * @param {Rect} r
- * @param {{anchorX:number, align:'left'|'right', arrow:boolean, text:string, color:string}} opt
+ * @param {{anchorX:number, align:'left'|'right', arrow:boolean, text:string, color:string, samples:Sample[], mode:'line'|'bar', from:number, to:number}} opt
  */
 function drawTag(ctx, r, opt) {
   ctx.font = FONTS.tag;
   const label = opt.arrow ? `▸ ${opt.text}` : opt.text;
   const tw = ctx.measureText(label).width;
   const w = tw + TAG_PAD_X * 2;
-  const top = r.y + r.h - TAG_H;
 
   let left = opt.align === 'left' ? opt.anchorX : opt.anchorX - w;
   if (opt.align === 'left' && left + w > r.x + r.w) left = opt.anchorX - w;
 
+  const topBottom = r.y + r.h - TAG_H;
+  const topTop = r.y;
+  const collBottom = tagCollisions(opt.samples, opt.mode, opt.from, opt.to, r, topBottom, true, left, w);
+  const collTop = tagCollisions(opt.samples, opt.mode, opt.from, opt.to, r, topTop, false, left, w);
+  const top = collTop < collBottom ? topTop : topBottom;
+
+  ctx.save();
+  ctx.globalAlpha = 0.92;
   ctx.fillStyle = opt.color;
   roundRect(ctx, left, top, w, TAG_H, TAG_RADIUS);
   ctx.fill();
+  ctx.globalAlpha = 0.9;
+  ctx.strokeStyle = '#FFFFFF';
+  ctx.lineWidth = 1;
+  roundRect(ctx, left + 0.5, top + 0.5, w - 1, TAG_H - 1, TAG_RADIUS);
+  ctx.stroke();
+  ctx.restore();
 
   ctx.fillStyle = '#FFFFFF';
   ctx.textAlign = 'left';

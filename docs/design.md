@@ -189,8 +189,8 @@ CREATE INDEX IF NOT EXISTS idx_samples_series_time ON samples (provider, win, ob
   - プロット（点）: 半径 3px（点の間隔が 2px 未満のときは 1.5px）。`あり/なし` で切替。棒グラフ時も点は棒の頂点に描く
   - 線幅 2px。線・棒・点は同じ系列色
 - **欠測区間（灰色）**: `gaps.mjs` の `computeGaps(samples, {from, to, now, factor:2.5})` が `[{from,to}]` を返す。(a) 隣接 ok 点の間隔が `intervalSec × factor` 超、(b) `error` 行の区間、(c) 表示範囲先頭から最初の点まで、(d) 最後の点から `now` まで（最後の点が閾値より古いとき）。灰色 `rgba(120,120,128,0.18)` の帯を全高に描き、上端に 4px の濃い灰色バーを置く。凡例に「欠測」を入れる
-- **リセット**: `resetsAt` が前の点より変わった（=窓が切り替わった）時刻に、細い点線の縦線を系列色の半透明で描く。凡例に「リセット」
-- **リセット予定**（2026-09-07 追加、発注者指示）: 最新 `ok` サンプルの `resetsAt` を Chrome DevTools Performance の Nav/FCP/DCL 風マーカーで描く。範囲内なら系列色の実線縦線 + プロット下端に重なる塗りつぶしタグ `リセット HH:mm`（今日以外は `M/D HH:mm`）。範囲より先（24h/7d/30d は `to = now` なので通常こちら）ならプロット右端に `▸ リセット HH:mm（あと 3h12m）` を固定表示。`resetsAt < now`（リセット済みだが新サンプル未取得）は灰色で `リセット済み`。残り時間の書式は `ticks.mjs` の `formatRemaining`（`1m未満` / `12m` / `3h12m` / `2d5h`）。ヘッダの現在値チップにも `· リセット HH:mm` を付記
+- **リセット**（2026-09-08 修正、発注者指示）: `shared/resets.mjs` の `pastResets(samples)` が検出した「実際に起きたリセット」の時刻に、細い点線の縦線を系列色の半透明で描く。未使用（`usedPercent` が 0 近辺）のウィンドウは `resetsAt` が `now + 窓長` をポーリングごとに返し続け前の点と毎回異なるため、単純な「前の点と `resetsAt` が違う」では誤検出になる（Codex 5h が典型）。そこで隣接する ok 点 a, b について: (1) a が予告した `resetsAt` が a, b の間に実際に経過していれば（`a.resetsAt > a.observedAt && a.resetsAt <= b.observedAt`）そこ（`a.resetsAt`）をリセットとみなす。(2) それに当てはまらなくても `b.resetsAt` が `a.resetsAt` より 60 秒超前進し、かつ使用率が目に見えて下がっていれば（`b.usedPercent < a.usedPercent - 5`）予告時刻が多少ずれていたリセットとみなし `b.observedAt` を使う。(3) それ以外は描かない。凡例に「リセット」
+- **リセット予定**（2026-09-07 追加 / 2026-09-08 修正、発注者指示）: 最新 `ok` サンプルの `resetsAt` を Chrome DevTools Performance の Nav/FCP/DCL 風マーカーで描く。範囲内なら系列色の実線縦線 + 塗りつぶしタグ `リセット HH:mm`（今日以外は `M/D HH:mm`）。範囲より先（24h/7d/30d は `to = now` なので通常こちら）ならプロット右端に `▸ リセット HH:mm（あと 3h12m）` を固定表示。`resetsAt < now`（リセット済みだが新サンプル未取得）は灰色で `リセット済み`。残り時間の書式は `ticks.mjs` の `formatRemaining`（`1m未満` / `12m` / `3h12m` / `2d5h`）。ヘッダの現在値チップにも `· リセット HH:mm` を付記。タグはプロット下端・上端どちらに置くかを、タグの水平範囲に入るデータ点との「衝突」数で選ぶ（棒グラフは 0% から生えるため下端タグには常に衝突、上端タグは値が非常に高いときだけ；折れ線はどちらも点の y がタグ矩形に入れば衝突）。衝突が少ない側を採用し、同数なら下端。タグは `globalAlpha 0.92` + 白い 1px 外枠で描き、下の棒・線が薄く透けて見えるようにする。最新 ok サンプルの使用率が 0% のとき（リセットする対象が無い）はタグを描かない（凡例は残す）
 - **凡例**: パネル下部。項目: `● Claude Code 5h limit 使用率`、`▬ 欠測`、`┆ リセット`、`▰ リセット予定`
 - **ホバー**: 最も近い点に小さなツールチップ（`9/7 03:24  42.0%  リセット 9/7 08:37`）
 - 描画は `requestAnimationFrame` でまとめ、`ResizeObserver` でリサイズに追従
@@ -236,6 +236,7 @@ CREATE INDEX IF NOT EXISTS idx_samples_series_time ON samples (provider, win, ob
 
 - `normalize.test.mjs`: Claude 応答 / Codex HTTP 応答 / Codex app-server 応答の正規化。`secondary_window` 無し、clamp、ISO と epoch 秒の変換
 - `gaps.test.mjs`: 閾値超の間隔、error 連続、先頭・末尾、`intervalSec` が途中で変わるケース
+- `resets.test.mjs`: 未使用ウィンドウの `resetsAt` スライド（誤検出しない）、秒未満のゆらぎ、実際のリセット（`resetsAt` 固定＋使用率低下）、予告時刻未経過だが使用率低下、ウィンドウ開始直後の使用率上昇（誤検出しない）
 - `ticks.test.mjs`: 幅 300px で 24h → 6h ステップ、幅 1800px で 24h → 1h（>= 50px を満たす最小）、30d → 2d 等。目盛りのアライメント
 - `ports.test.mjs`: 使用中ポートを避けること
 - `db.test.mjs`: 一時ファイルで insert → query の往復、範囲外前後 1 点の包含
