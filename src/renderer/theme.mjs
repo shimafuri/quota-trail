@@ -85,4 +85,5 @@ export const FONTS = Object.freeze({
   axis: '11px system-ui, "Segoe UI", "Meiryo", sans-serif',
   legend: '11px system-ui, "Segoe UI", "Meiryo", sans-serif',
   tooltip: '12px system-ui, "Segoe UI", "Meiryo", sans-serif',
+  tag: 'bold 11px system-ui, "Segoe UI", "Meiryo", sans-serif',
 });

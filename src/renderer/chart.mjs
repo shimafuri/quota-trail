@@ -5,7 +5,14 @@
  * @module renderer/chart
  */
 
-import { pickTimeStep, timeTicks, formatTickLabel, formatDateTime } from '/shared/ticks.mjs';
+import {
+  pickTimeStep,
+  timeTicks,
+  formatTickLabel,
+  formatDateTime,
+  formatClockLabel,
+  formatRemaining,
+} from '/shared/ticks.mjs';
 import { COLORS, FONTS } from './theme.mjs';
 
 /** @typedef {import('/shared/gaps.mjs').Sample} Sample */
@@ -18,6 +25,9 @@ const LEGEND_GAP = 14;
 const GAP_BAR_H = 4;
 const DEFAULT_INTERVAL_SEC = 180;
 const LINE_BREAK_FACTOR = 2.5;
+const TAG_H = 16;
+const TAG_PAD_X = 5;
+const TAG_RADIUS = 3;
 
 /**
  * @param {Sample} s
@@ -31,7 +41,7 @@ function intervalMs(s) {
  * 凡例の行数を測る。
  * @param {CanvasRenderingContext2D} ctx
  * @param {number} cssW
- * @param {{symbol:'dot'|'band'|'dash', color:string, text:string}[]} items
+ * @param {{symbol:'dot'|'band'|'dash'|'tag', color:string, text:string}[]} items
  * @returns {number}
  */
 function legendLineCount(ctx, cssW, items) {
@@ -107,6 +117,7 @@ function valueToY(v, r) {
  * @property {'line'|'bar'} mode
  * @property {boolean} showPoints
  * @property {{x:number,y:number}|null} [hover] カーソル位置（CSS px、canvas 基準）
+ * @property {number|null} [nextResetAt] 予定されているリセット時刻（ms）。無ければ null
  */
 
 /**
@@ -135,6 +146,7 @@ export function drawChart(canvas, opts) {
     { symbol: /** @type {'dot'} */ ('dot'), color: opts.color, text: opts.legendLabel },
     { symbol: /** @type {'band'} */ ('band'), color: COLORS.gapBar, text: '欠測' },
     { symbol: /** @type {'dash'} */ ('dash'), color: opts.color, text: 'リセット' },
+    { symbol: /** @type {'tag'} */ ('tag'), color: opts.color, text: 'リセット予定' },
   ];
   const lines = legendLineCount(ctx, cssW, legendItems);
   const r = plotRect(cssW, cssH, lines);
@@ -148,6 +160,7 @@ export function drawChart(canvas, opts) {
   drawXAxis(ctx, r, cssW, from, to);
   drawResets(ctx, r, opts.samples || [], from, to, opts.color);
   drawSeries(ctx, r, opts, from, to);
+  drawNextReset(ctx, r, opts.nextResetAt ?? null, from, to, opts.now, opts.color);
   drawFrame(ctx, r);
   drawLegend(ctx, cssW, cssH, lines, legendItems);
   if (opts.hover) drawTooltip(ctx, r, cssW, cssH, opts, from, to);
@@ -293,6 +306,88 @@ function drawResets(ctx, r, samples, from, to, color) {
 }
 
 /**
+ * 「次回リセット予定」マーカーを描く（Chrome DevTools Performance パネルの
+ * Nav/FCP/DCL タグ風）。プロット上部から下部までの縦線 + プロット下端に重なる
+ * 塗りつぶしタグ。表示範囲より先（右）にあるのが通常ケース（24h/7d/30d は
+ * `to = now` のため）で、その場合は右端に固定して残り時間を添える。
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {Rect} r
+ * @param {number|null} nextResetAt 次回リセット予定時刻（ms）。無ければ null
+ * @param {number} from
+ * @param {number} to
+ * @param {number} now
+ * @param {string} color 系列色
+ */
+function drawNextReset(ctx, r, nextResetAt, from, to, now, color) {
+  if (nextResetAt == null || !Number.isFinite(nextResetAt) || nextResetAt < from) return;
+
+  const already = nextResetAt < now;
+  const drawColor = already ? COLORS.gapBar : color;
+  const prefix = already ? 'リセット済み' : 'リセット';
+  const clock = formatClockLabel(nextResetAt, now);
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(r.x, r.y, r.w, r.h);
+  ctx.clip();
+
+  if (nextResetAt <= to) {
+    // 表示範囲内: 縦線 + 線の位置に左寄せしたタグ
+    const x = timeToX(nextResetAt, from, to, r);
+    ctx.strokeStyle = drawColor;
+    ctx.globalAlpha = 0.85;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(x, r.y);
+    ctx.lineTo(x, r.y + r.h);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    const text = `${prefix} ${clock}`;
+    drawTag(ctx, r, { anchorX: x, align: 'left', arrow: false, text, color: drawColor });
+  } else {
+    // 表示範囲より先: プロット右端に固定し、残り時間を添える
+    const text = already
+      ? `${prefix} ${clock}`
+      : `${prefix} ${clock}（あと ${formatRemaining(nextResetAt - now)}）`;
+    drawTag(ctx, r, { anchorX: r.x + r.w, align: 'right', arrow: !already, text, color: drawColor });
+  }
+
+  ctx.restore();
+}
+
+/**
+ * DevTools 風のタグ（角丸の塗りつぶし矩形 + 白い太字テキスト）をプロット下端に描く。
+ * `align:'left'` は `anchorX` を左端にし、右端がプロットをはみ出すなら右端を
+ * `anchorX` に付け替える。`align:'right'` は常に `anchorX` を右端にする。
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {Rect} r
+ * @param {{anchorX:number, align:'left'|'right', arrow:boolean, text:string, color:string}} opt
+ */
+function drawTag(ctx, r, opt) {
+  ctx.font = FONTS.tag;
+  const label = opt.arrow ? `▸ ${opt.text}` : opt.text;
+  const tw = ctx.measureText(label).width;
+  const w = tw + TAG_PAD_X * 2;
+  const top = r.y + r.h - TAG_H;
+
+  let left = opt.align === 'left' ? opt.anchorX : opt.anchorX - w;
+  if (opt.align === 'left' && left + w > r.x + r.w) left = opt.anchorX - w;
+
+  ctx.fillStyle = opt.color;
+  roundRect(ctx, left, top, w, TAG_H, TAG_RADIUS);
+  ctx.fill();
+
+  ctx.fillStyle = '#FFFFFF';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, left + TAG_PAD_X, top + TAG_H / 2 + 0.5);
+}
+
+/**
  * 典型的な 1 サンプルあたりの px 幅。
  * @param {Sample[]} samples
  * @param {number} from
@@ -394,7 +489,7 @@ function drawSeries(ctx, r, opts, from, to) {
  * @param {number} cssW
  * @param {number} cssH
  * @param {number} lines
- * @param {{symbol:'dot'|'band'|'dash', color:string, text:string}[]} items
+ * @param {{symbol:'dot'|'band'|'dash'|'tag', color:string, text:string}[]} items
  */
 function drawLegend(ctx, cssW, cssH, lines, items) {
   ctx.font = FONTS.legend;
@@ -423,6 +518,10 @@ function drawLegend(ctx, cssW, cssH, lines, items) {
       ctx.fillRect(x, y - 4, 9, 8);
       ctx.fillStyle = COLORS.gapBar;
       ctx.fillRect(x, y - 4, 9, 2);
+    } else if (it.symbol === 'tag') {
+      ctx.fillStyle = it.color;
+      roundRect(ctx, x, y - 4.5, 14, 9, 2);
+      ctx.fill();
     } else {
       ctx.save();
       ctx.globalAlpha = 0.7;

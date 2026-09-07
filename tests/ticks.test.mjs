@@ -6,6 +6,7 @@ import {
   pickTimeStep,
   timeTicks,
   formatTickLabel,
+  formatRemaining,
 } from '../src/shared/ticks.mjs';
 
 const MIN = 60_000;
@@ -163,4 +164,12 @@ test('formatTickLabel: ステップに応じた書式', () => {
   assert.equal(formatTickLabel(b, HOUR, a), '09:05');
   assert.equal(formatTickLabel(c, HOUR, b), '9/8 00:00'); // 日付が変わる目盛り
   assert.equal(formatTickLabel(c, DAY, b), '9/8');
+});
+
+test('formatRemaining: 区間ごとの書式', () => {
+  assert.equal(formatRemaining(30 * 1000), '1m未満'); // 1分未満
+  assert.equal(formatRemaining(12 * MIN), '12m'); // 1時間未満
+  assert.equal(formatRemaining(3 * HOUR + 12 * MIN), '3h12m'); // 1日未満
+  assert.equal(formatRemaining(2 * DAY + 5 * HOUR), '2d5h'); // それ以上
+  assert.equal(formatRemaining(-100), '0m'); // 負数
 });

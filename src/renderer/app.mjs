@@ -4,7 +4,7 @@
  */
 
 import { computeGaps } from '/shared/gaps.mjs';
-import { formatDateTime } from '/shared/ticks.mjs';
+import { formatDateTime, formatClockLabel } from '/shared/ticks.mjs';
 import { SERIES, SERIES_KEYS } from './theme.mjs';
 import { drawChart, xToTime, nearestSample } from './chart.mjs';
 
@@ -401,6 +401,27 @@ function attachInteractions(panel) {
   });
 }
 
+// ---------------------------------------------------------------- リセット予定
+
+/**
+ * パネルの「次回リセット予定」時刻。`/api/latest` の newest ok サンプルの
+ * `resetsAt` を優先し、無ければ `state.data[key]` 内の最後の ok サンプルにフォールバックする。
+ * @param {SeriesKey} key
+ * @returns {number|null}
+ */
+function nextResetAtFor(key) {
+  const latest = state.latest[key];
+  if (latest && latest.status === 'ok' && Number.isFinite(latest.resetsAt)) {
+    return latest.resetsAt;
+  }
+  const samples = state.data[key] || [];
+  for (let i = samples.length - 1; i >= 0; i--) {
+    const s = samples[i];
+    if (s.status === 'ok' && Number.isFinite(s.resetsAt)) return s.resetsAt;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------- 描画
 
 let rafId = 0;
@@ -432,6 +453,7 @@ function drawAll() {
       mode: ps.mode,
       showPoints: ps.points,
       hover: panel.hover,
+      nextResetAt: nextResetAtFor(panel.key),
     });
   }
 }
@@ -457,6 +479,12 @@ function renderHeader() {
       item.classList.add('is-error');
       item.appendChild(el('b', undefined, '--'));
       if (s && s.errorCode) item.title = s.errorCode;
+    }
+    const nextResetAt = nextResetAtFor(key);
+    if (nextResetAt != null) {
+      item.appendChild(
+        el('span', 'reset-suffix', ` · リセット ${formatClockLabel(nextResetAt, state.now)}`),
+      );
     }
     if (s && Number.isFinite(s.observedAt)) newest = Math.max(newest, s.observedAt);
     box.appendChild(item);

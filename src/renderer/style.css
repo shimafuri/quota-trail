@@ -97,6 +97,12 @@ body {
   color: var(--muted);
 }
 
+.current-value .reset-suffix {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: normal;
+}
+
 /* ---------- グリッド ---------- */
 
 .grid {

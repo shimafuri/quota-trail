@@ -180,3 +180,43 @@ export function formatDateTime(t) {
   const d = new Date(t);
   return `${d.getMonth() + 1}/${d.getDate()} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
+
+/**
+ * `ref` と同じローカル日付なら `HH:mm`、そうでなければ `M/D HH:mm`。
+ * リセットマーカー・ヘッダのチップ表示に使う。
+ *
+ * @param {number} t epoch ms
+ * @param {number} ref 基準時刻（epoch ms）。通常は現在時刻
+ * @returns {string}
+ */
+export function formatClockLabel(t, ref) {
+  const d = new Date(t);
+  const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  const sameDay = startOfLocalDay(t) === startOfLocalDay(ref);
+  return sameDay ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+}
+
+/**
+ * 残り時間の短い表示。
+ * - 1 分未満: `1m未満`
+ * - 1 時間未満: `12m`
+ * - 1 日未満: `3h12m`
+ * - それ以上: `2d5h`
+ * - 0 以下（不正入力含む）: `0m`
+ *
+ * @param {number} ms 残り時間（ms）
+ * @returns {string}
+ */
+export function formatRemaining(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '0m';
+  if (ms < MIN) return '1m未満';
+  if (ms < HOUR) return `${Math.floor(ms / MIN)}m`;
+  if (ms < DAY) {
+    const h = Math.floor(ms / HOUR);
+    const m = Math.floor((ms % HOUR) / MIN);
+    return `${h}h${m}m`;
+  }
+  const d = Math.floor(ms / DAY);
+  const h = Math.floor((ms % DAY) / HOUR);
+  return `${d}d${h}h`;
+}

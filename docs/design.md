@@ -190,7 +190,8 @@ CREATE INDEX IF NOT EXISTS idx_samples_series_time ON samples (provider, win, ob
   - 線幅 2px。線・棒・点は同じ系列色
 - **欠測区間（灰色）**: `gaps.mjs` の `computeGaps(samples, {from, to, now, factor:2.5})` が `[{from,to}]` を返す。(a) 隣接 ok 点の間隔が `intervalSec × factor` 超、(b) `error` 行の区間、(c) 表示範囲先頭から最初の点まで、(d) 最後の点から `now` まで（最後の点が閾値より古いとき）。灰色 `rgba(120,120,128,0.18)` の帯を全高に描き、上端に 4px の濃い灰色バーを置く。凡例に「欠測」を入れる
 - **リセット**: `resetsAt` が前の点より変わった（=窓が切り替わった）時刻に、細い点線の縦線を系列色の半透明で描く。凡例に「リセット」
-- **凡例**: パネル下部。項目: `● Claude Code 5h limit 使用率`、`▬ 欠測`、`┆ リセット`
+- **リセット予定**（2026-09-07 追加、発注者指示）: 最新 `ok` サンプルの `resetsAt` を Chrome DevTools Performance の Nav/FCP/DCL 風マーカーで描く。範囲内なら系列色の実線縦線 + プロット下端に重なる塗りつぶしタグ `リセット HH:mm`（今日以外は `M/D HH:mm`）。範囲より先（24h/7d/30d は `to = now` なので通常こちら）ならプロット右端に `▸ リセット HH:mm（あと 3h12m）` を固定表示。`resetsAt < now`（リセット済みだが新サンプル未取得）は灰色で `リセット済み`。残り時間の書式は `ticks.mjs` の `formatRemaining`（`1m未満` / `12m` / `3h12m` / `2d5h`）。ヘッダの現在値チップにも `· リセット HH:mm` を付記
+- **凡例**: パネル下部。項目: `● Claude Code 5h limit 使用率`、`▬ 欠測`、`┆ リセット`、`▰ リセット予定`
 - **ホバー**: 最も近い点に小さなツールチップ（`9/7 03:24  42.0%  リセット 9/7 08:37`）
 - 描画は `requestAnimationFrame` でまとめ、`ResizeObserver` でリサイズに追従
 
