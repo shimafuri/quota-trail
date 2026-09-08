@@ -30,6 +30,12 @@ npm install
 npm start
 ```
 
+ターミナルを閉じたときに巻き込まれて終了しないようにするには、次のスクリプトで起こしてください（WMI 経由で起動し、親プロセスがターミナルから切り離されます）。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/start-detached.ps1
+```
+
 トレイにアイコンが出ます。左クリックまたは右クリックメニューの
 「ダッシュボードを開く」で `http://127.0.0.1:47811/` がブラウザで開きます。
 
