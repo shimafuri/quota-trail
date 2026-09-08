@@ -115,7 +115,7 @@ interface Sample {
 - tick: `observedAt = Date.now()` を決め、Claude と Codex を **並行** に取得（`Promise.allSettled`）。結果 4 行を 1 トランザクションで insert
 - 起動直後に 1 回即時実行。トレイ「今すぐ取得」でも実行（進行中なら無視。single-flight）
 - 取得失敗時も **間隔は変えない**（バックオフ無し）。欠測を作らないため。ただし HTTP 429 のときだけ次回まで 2 倍間隔にする（その tick は `error/http_429` 行を書く）
-- PC スリープ復帰で tick が遅れた場合は、その遅れがそのまま欠測（灰色）として見える。これは仕様
+- PC スリープ復帰・ロック解除（`powerMonitor` の `resume` / `unlock-screen`）では `runNow()` を呼び、次のサンプルを即時取得する（欠測期間を短縮。single-flight のため実行中なら無視）。それでも `setTimeout` の予定発火時刻より 2 倍以上遅れて発火した場合は `tick が遅延`（warn、遅延秒数つき）をログに残す
 
 ## 5. 永続化（SQLite）
 
@@ -232,6 +232,8 @@ CREATE INDEX IF NOT EXISTS idx_samples_series_time ON samples (provider, win, ob
 ## 10. ログ
 
 - `userData/logs/quota-trail.log` に 1 行 JSON（時刻・レベル・メッセージ）。1 MB でローテーション（1 世代）。トークンやヘッダは絶対に出さない
+- 異常終了の追跡用に app のライフサイクルイベント（`before-quit` / `will-quit` / `quit`（`exitCode` 付き）/ `powerMonitor` の `suspend` `resume` `lock-screen` `unlock-screen` `shutdown` `on-ac` `on-battery`（Linux では登録省略）/ `process` の `exit` `SIGINT` `SIGTERM` `SIGHUP`）を毎回ログする。`will-quit` には終了理由 `quitReason`（`tray-menu` / `second-instance` / `signal:<name>` / `power-shutdown` / `unknown`）を添える
+- `userData/last-alive.json` を 60 秒ごとに `{ at, pid, uptimeSec }` で上書き（tmp に書いてから rename）。起動時にこのファイルの `at` が 3 分より古ければ、前回インスタンスが正常終了しなかったとみなして `前回のインスタンスは正常終了せずに消えた`（warn）をログする
 
 ## 11. テスト（`node:test`）
 

@@ -24,6 +24,9 @@ export function createScheduler({ db, readConfig, onSamples }) {
   let doubleNextInterval = false;
   /** @type {number|null} */
   let lastTickAt = null;
+  /** setTimeout で予定していた発火時刻（PC スリープ復帰などの遅延検出用） */
+  let nextTickPlannedAt = null;
+  let nextTickIntervalMs = null;
 
   async function tick() {
     if (inFlight) return null;
@@ -74,10 +77,20 @@ export function createScheduler({ db, readConfig, onSamples }) {
       logger.warn('429 を受けたため次回だけ間隔を 2 倍にする', { ms });
     }
     if (timer) clearTimeout(timer);
+    nextTickPlannedAt = Date.now() + ms;
+    nextTickIntervalMs = ms;
     timer = setTimeout(loop, ms);
   }
 
   async function loop() {
+    if (nextTickPlannedAt !== null && nextTickIntervalMs !== null) {
+      const delayMs = Date.now() - nextTickPlannedAt;
+      if (delayMs > nextTickIntervalMs * 2) {
+        logger.warn('tick が遅延', { delaySec: Math.round(delayMs / 1000) });
+      }
+    }
+    nextTickPlannedAt = null;
+    nextTickIntervalMs = null;
     try {
       await tick();
     } catch (e) {

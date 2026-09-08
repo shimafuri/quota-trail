@@ -1,6 +1,7 @@
 // Electron エントリ（設計書 §3 / §8）
 // single-instance lock → config → logger → db → server → tray → scheduler
-import { app } from 'electron';
+import { app, powerMonitor } from 'electron';
+import fs from 'node:fs';
 import path from 'node:path';
 
 import * as logger from './logger.mjs';
@@ -21,12 +22,19 @@ let scheduler = null;
 /** @type {ReturnType<typeof createTray>|null} */
 let tray = null;
 let quitting = false;
+/** will-quit で理由を出すための記録。'tray-menu' | 'second-instance' | 'signal:<name>' | 'power-shutdown' | 'unknown' */
+let quitReason = 'unknown';
+/** @type {NodeJS.Timeout|null} */
+let lastAliveTimer = null;
+/** @type {string|null} */
+let lastAlivePath = null;
 
 const appRoot = app.getAppPath();
 
 // --- 単一インスタンス --------------------------------------------------------
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
+  quitReason = 'second-instance';
   app.quit();
 } else {
   app.on('second-instance', () => {
@@ -44,7 +52,65 @@ if (!gotLock) {
   });
 }
 
+/** userData/last-alive.json を書き込む（前回異常終了の検知用） */
+function writeLastAlive(startedAt) {
+  if (!lastAlivePath) return;
+  const rec = {
+    at: new Date().toISOString(),
+    pid: process.pid,
+    uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+  };
+  const tmp = `${lastAlivePath}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(rec));
+    fs.renameSync(tmp, lastAlivePath);
+  } catch (e) {
+    logger.warn('last-alive.json の更新に失敗', { error: String(e && e.message ? e.message : e) });
+  }
+}
+
+/** 前回インスタンスが last-alive.json を更新したまま消えていないか確認する */
+function checkPreviousInstanceAlive() {
+  if (!lastAlivePath) return;
+  try {
+    if (!fs.existsSync(lastAlivePath)) return;
+    const prev = JSON.parse(fs.readFileSync(lastAlivePath, 'utf8'));
+    const prevAt = new Date(prev.at).getTime();
+    if (Number.isFinite(prevAt) && Date.now() - prevAt > 3 * 60_000) {
+      logger.warn('前回のインスタンスは正常終了せずに消えた', { lastAliveAt: prev.at, pid: prev.pid });
+    }
+  } catch (e) {
+    logger.warn('last-alive.json の確認に失敗', { error: String(e && e.message ? e.message : e) });
+  }
+}
+
+/** powerMonitor イベントをログし、resume/unlock-screen で即時 tick する */
+function registerPowerMonitorLogging() {
+  const events = ['suspend', 'resume', 'lock-screen', 'unlock-screen', 'shutdown'];
+  for (const evt of events) {
+    powerMonitor.on(evt, () => {
+      if (evt === 'shutdown') quitReason = 'power-shutdown';
+      logger.info('powerMonitor', { event: evt });
+      if (evt === 'resume' || evt === 'unlock-screen') {
+        // スリープ復帰・ロック解除後の最初のサンプルを即時取得する（設計書 §4.5）
+        void scheduler?.runNow();
+      }
+    });
+  }
+  // on-ac / on-battery は darwin/win32 のみ（Linux では発火しないので登録を省く）
+  if (process.platform !== 'linux') {
+    for (const evt of ['on-ac', 'on-battery']) {
+      try {
+        powerMonitor.on(evt, () => logger.info('powerMonitor', { event: evt }));
+      } catch (e) {
+        logger.warn('powerMonitor イベント登録に失敗', { event: evt, error: String(e && e.message ? e.message : e) });
+      }
+    }
+  }
+}
+
 async function main() {
+  const startedAt = Date.now();
   const userData = app.getPath('userData');
   logger.initLogger(path.join(userData, 'logs'));
   const cfgFile = initConfig(userData);
@@ -55,6 +121,12 @@ async function main() {
     userData,
     configPath: cfgFile,
   });
+
+  // 前回異常終了の検知（last-alive.json ベース。ログはパースしない）
+  lastAlivePath = path.join(userData, 'last-alive.json');
+  checkPreviousInstanceAlive();
+  writeLastAlive(startedAt);
+  lastAliveTimer = setInterval(() => writeLastAlive(startedAt), 60_000);
 
   // DB
   const dbFile = path.join(userData, 'quota-trail.sqlite');
@@ -91,7 +163,7 @@ async function main() {
     getUrl: () => server?.url ?? '',
     getLatest: () => (db ? db.latest() : {}),
     onFetchNow: () => { void scheduler?.runNow(); },
-    onQuit: () => { quitting = true; app.quit(); },
+    onQuit: () => { quitReason = 'tray-menu'; quitting = true; app.quit(); },
   });
 
   // スケジューラ
@@ -102,16 +174,26 @@ async function main() {
   });
   scheduler.start();
   tray.refresh();
+
+  registerPowerMonitorLogging();
 }
 
-app.on('before-quit', () => { quitting = true; });
+app.on('before-quit', () => {
+  quitting = true;
+  logger.info('before-quit');
+});
+
+app.on('quit', (_event, exitCode) => {
+  logger.info('quit', { exitCode, quitReason });
+});
 
 app.on('will-quit', () => {
+  if (lastAliveTimer) { clearInterval(lastAliveTimer); lastAliveTimer = null; }
   try { scheduler?.stop(); } catch { /* noop */ }
   try { tray?.destroy(); } catch { /* noop */ }
   try { void server?.close(); } catch { /* noop */ }
   try { db?.close(); } catch { /* noop */ }
-  logger.info('終了', { quitting });
+  logger.info('終了', { quitting, quitReason });
 });
 
 process.on('uncaughtException', (e) => {
@@ -120,3 +202,16 @@ process.on('uncaughtException', (e) => {
 process.on('unhandledRejection', (e) => {
   logger.error('unhandledRejection', { error: String(e) });
 });
+
+// exit は同期処理しか実行できない。logger は appendFileSync を使うため間に合う
+process.on('exit', (code) => {
+  logger.info('process exit', { code });
+});
+
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => {
+    quitReason = `signal:${sig}`;
+    logger.warn('シグナル受信', { signal: sig });
+    app.quit();
+  });
+}
