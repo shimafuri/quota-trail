@@ -23,7 +23,7 @@ Claude Code と Codex CLI の **5h limit / Weekly limit の使用率（%）を 3
 | グラフ | 自前 Canvas 2D 描画（ライブラリ無し） | 要件（ホイールズーム→カスタム連動、欠測の灰色帯、目盛り最小 50px、棒/折れ線切替、点の有無）はライブラリに合わせるより自前の方が短い。CDN 依存も無し |
 | HTTP | Node `http` 標準 | 静的ファイル + JSON API のみ |
 | テスト | `node:test` | 追加依存無し。純粋ロジック（正規化・ギャップ検出・目盛り計算・ポート選択）を対象 |
-| パッケージ | `electron-builder`（portable + NSIS、後日） | v1 は `npm start` で動くことを受け入れ条件とし、exe 化は設定だけ用意 |
+| パッケージ | `electron-builder --win dir`（`npm run build:dir` → `dist\win-unpacked\quota-trail.exe`）。portable + NSIS は後日 | **運用はパッケージ済み exe を使う**。開発起動の `electron.exe` は名前が汎用的なため、他プロジェクトの無差別な `Stop-Process electron` に巻き込まれて落ちる（2026-09-08 の事故）。`quota-trail.exe` なら巻き込まれない。`asar: false`（ローカル用途で最も単純）、`npmRebuild: false`（`prepare-native.mjs` の Node / Electron 2 種の `better_sqlite3-*.node` を壊さないため）。`electron-builder` は 26.13.0 に固定（26.14.0 以降は ESM 専用の `@noble/hashes` v2 を CJS から `require()` するため Node 20 でビルド不可） |
 
 ## 3. 構成
 
@@ -146,7 +146,7 @@ CREATE INDEX IF NOT EXISTS idx_samples_series_time ON samples (provider, win, ob
 - `server.mjs`: `127.0.0.1` にのみ bind。ポートは `config.port`（既定 **47811**）を試し、`EADDRINUSE` なら 47811..47899 を順に探し、それも駄目なら `listen(0)` の動的ポート。決まったポートは `config.json` に書き戻す（次回同じ URL になるよう）。トレイ「ダッシュボードを開く」は `shell.openExternal('http://127.0.0.1:<port>/')`
 - 静的: `src/renderer/*` と `src/shared/*`（`/shared/` 配下）を配信。`Content-Type` は拡張子で（`.mjs` → `text/javascript`）。`Cache-Control: no-store`。パストラバーサル禁止
 - API（JSON。CORS ヘッダは付けない）:
-  - `GET /api/meta` → `{ providers:['claude','codex'], windows:['5h','weekly'], pollIntervalSec, now, dbPath }`
+  - `GET /api/meta` → `{ providers:['claude','codex'], windows:['5h','weekly'], pollIntervalSec, now, dbPath, backend, autostart }`。`autostart` は `autostart.isEnabled()` の値（読み取り専用。変更はトレイメニューのみ）
   - `GET /api/samples?from=<ms>&to=<ms>` → `{ series: { "claude/5h": Sample[], "claude/weekly": [...], "codex/5h": [...], "codex/weekly": [...] }, now }`。`from`/`to` 必須。1 系列あたり上限 50,000 行（超えたら等間隔に間引き、`decimated:true`）
   - `GET /api/latest` → 4 系列の最新 1 行（トレイのツールチップにも同じ関数を使う）
 - セキュリティ: localhost 限定・読み取り専用・トークン等は一切返さない
@@ -220,6 +220,8 @@ CREATE INDEX IF NOT EXISTS idx_samples_series_time ON samples (provider, win, ob
   6. `終了`
 - ウィンドウは持たない（`window-all-closed` で終了しない）。`app.requestSingleInstanceLock()` で二重起動を防ぎ、2 つ目は 1 つ目にダッシュボードを開かせて終了
 - 自動起動: `app.setLoginItemSettings({ openAtLogin, path: process.execPath, args })`。開発時（未パッケージ）は `args: [app.getAppPath()]`、パッケージ時は `args: []`。Windows は HKCU `Run` に書かれる
+  - パッケージ済み exe（`dist\win-unpacked\quota-trail.exe`）から登録した場合、`process.execPath` がその exe になるため **`quota-trail` という名前で登録される**（開発起動だと `electron` 名になり、他プロジェクトの `Stop-Process electron` に巻き込まれる）。運用ではパッケージ済み exe から登録すること
+  - 現在の状態は `GET /api/meta` の `autostart` でも読める（読み取り専用。`index.mjs` が `getAutostart: () => autostart.isEnabled()` を `startServer` に渡す）
 
 ## 9. 設定（`userData/config.json`）
 

@@ -49,6 +49,7 @@ test('HTTP API: /api/meta, /api/latest, /api/samples', async (t) => {
     db: fakeDb(),
     readConfig: () => ({ pollIntervalSec: 180, port: 0 }),
     appRoot,
+    getAutostart: () => true,
   });
   t.after(() => server.close());
   const base = server.url.replace(/\/$/, '');
@@ -59,6 +60,7 @@ test('HTTP API: /api/meta, /api/latest, /api/samples', async (t) => {
   assert.equal(meta.pollIntervalSec, 180);
   assert.equal(typeof meta.now, 'number');
   assert.equal(meta.dbPath, 'C:/tmp/fake.sqlite');
+  assert.equal(meta.autostart, true);
 
   const latest = await (await fetch(`${base}/api/latest`)).json();
   assert.equal(latest.series['claude/5h'].usedPercent, 41.5);

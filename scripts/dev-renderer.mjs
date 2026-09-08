@@ -304,6 +304,7 @@ const server = http.createServer((req, res) => {
       pollIntervalSec: POLL_INTERVAL_SEC,
       now: Date.now(),
       dbPath: 'C:\\Users\\dev\\AppData\\Roaming\\quota-trail\\quota-trail.sqlite (dev fake)',
+      autostart: false,
     });
     return;
   }

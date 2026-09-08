@@ -10,6 +10,7 @@ import { openDb } from './db.mjs';
 import { startServer } from './server.mjs';
 import { createScheduler } from './scheduler.mjs';
 import { createTray } from './tray.mjs';
+import * as autostart from './autostart.mjs';
 import * as claude from './providers/claude.mjs';
 import * as codex from './providers/codex.mjs';
 
@@ -151,6 +152,7 @@ async function main() {
     db,
     readConfig,
     appRoot,
+    getAutostart: () => autostart.isEnabled(),
     onPort: (port) => {
       // 実際に bind したポートを書き戻す（次回同じ URL になるように）
       if (readConfig().port !== port) writeConfig({ port });

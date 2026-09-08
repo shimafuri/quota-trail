@@ -26,15 +26,35 @@ npm install
 
 ## 起動
 
-```sh
-npm start
-```
+### 運用（推奨）: パッケージ済み exe
 
-ターミナルを閉じたときに巻き込まれて終了しないようにするには、次のスクリプトで起こしてください（WMI 経由で起動し、親プロセスがターミナルから切り離されます）。
+```sh
+npm run build:dir       # electron-builder --win dir → dist\win-unpacked\quota-trail.exe
+```
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/start-detached.ps1
 ```
+
+**運用では必ずパッケージ済み exe を使ってください。** `npm start` の開発起動は
+プロセス名が汎用的な `electron.exe` になるため、他プロジェクトが行う無差別な
+`Stop-Process electron` に巻き込まれて落ちます（2026-09-08 の事故）。
+パッケージ済み exe はプロセス名が `quota-trail.exe` になるので巻き込まれません。
+
+`scripts/start-detached.ps1` は `dist\win-unpacked\quota-trail.exe` があればそれを、
+無ければ開発用の `electron.exe "<repo>"` を起動し、どちらを使ったかを表示します
+（WMI 経由で起動するため、起動元のターミナルを閉じても巻き込まれません）。
+
+**コードを変更したら `npm run build:dir` で作り直し**、既存インスタンスを終了してから
+`scripts/start-detached.ps1` で起こし直してください。
+
+### 開発
+
+```sh
+npm start
+```
+
+renderer をライブで編集しながら試すときはこちら（`electron.exe` として動きます）。
 
 トレイにアイコンが出ます。左クリックまたは右クリックメニューの
 「ダッシュボードを開く」で `http://127.0.0.1:47811/` がブラウザで開きます。
@@ -72,19 +92,26 @@ npm test
 
 トレイメニューの「Windows 起動時に実行する」は Electron の `app.setLoginItemSettings` を呼び、
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` に登録します（チェックを外すと削除）。
+パッケージ済み exe から登録すると `quota-trail`（= `dist\win-unpacked\quota-trail.exe`）という名前で登録されます。
 `npm start` の開発起動でも登録できますが、その場合は `electron.exe` にリポジトリのパスを渡す形になるため、
 リポジトリを移動したら登録し直してください。
+現在の登録状態は `GET /api/meta` の `autostart` でも確認できます（読み取り専用。変更はトレイメニューから）。
 
 ## API（読み取り専用・localhost 限定）
 
-- `GET /api/meta` … プロバイダー / 窓の一覧、取得間隔、現在時刻、DB パス
+- `GET /api/meta` … プロバイダー / 窓の一覧、取得間隔、現在時刻、DB パス、SQLite バックエンド、自動起動の有無（`autostart`、読み取り専用）
 - `GET /api/samples?from=<epoch ms>&to=<epoch ms>` … 4 系列の履歴（範囲外の直前・直後 1 点を含む）
 - `GET /api/latest` … 4 系列の最新 1 行
 
-## パッケージング（未検証）
+## パッケージング
 
 ```sh
-npm run build   # electron-builder --win portable nsis
+npm run build:dir   # electron-builder --win dir → dist\win-unpacked\quota-trail.exe（検証済み）
+npm run build       # electron-builder --win portable nsis（未検証）
 ```
 
-v1 の受け入れ条件は `npm start` で動くことなので、`electron-builder` は設定のみ用意しています。
+- `asar: false`（ローカル用途。ネイティブモジュールをそのまま置くのが最も単純）
+- `npmRebuild: false`（`scripts/prepare-native.mjs` が用意した Node / Electron 2 種の
+  `better_sqlite3-*.node` を electron-builder のリビルドで壊さないため）
+- `electron-builder` は **26.13.0 に固定**しています。26.14.0 以降は `@noble/hashes` v2（ESM 専用）を
+  CJS から `require()` するため、Node 20 系では `ERR_REQUIRE_ESM` でビルドできません

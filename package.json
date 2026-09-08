@@ -11,15 +11,20 @@
     "rebuild": "electron-rebuild -f -w better-sqlite3",
     "postinstall": "node scripts/prepare-native.mjs",
     "make-icon": "node scripts/make-icon.mjs",
-    "build": "electron-builder --win portable nsis"
+    "build": "electron-builder --win portable nsis",
+    "build:dir": "electron-builder --win dir"
   },
   "build": {
     "appId": "io.github.shimafuri.quota-trail",
     "productName": "quota-trail",
+    "asar": false,
+    "npmRebuild": false,
     "files": [
       "src/**/*",
       "assets/**/*",
-      "package.json"
+      "package.json",
+      "!node_modules/better-sqlite3/build/Release/obj/**",
+      "!node_modules/better-sqlite3/build/Release/*.{iobj,ipdb,lib,exp}"
     ],
     "win": {
       "target": [
@@ -40,6 +45,6 @@
   "devDependencies": {
     "@electron/rebuild": "^3.7.2",
     "electron": "^38.2.0",
-    "electron-builder": "^26.0.12"
+    "electron-builder": "26.13.0"
   }
 }

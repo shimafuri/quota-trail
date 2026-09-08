@@ -85,9 +85,10 @@ function sendText(res, status, text) {
  * @param {() => {pollIntervalSec:number, port:number}} deps.readConfig
  * @param {string} deps.appRoot   リポジトリ／アプリのルート
  * @param {(port:number) => void} [deps.onPort]  実際に bind したポートの通知
+ * @param {() => boolean} [deps.getAutostart]  Windows 自動起動が有効かどうか（省略時は false）
  * @returns {Promise<{port:number, url:string, close:()=>Promise<void>}>}
  */
-export async function startServer({ db, readConfig, appRoot, onPort }) {
+export async function startServer({ db, readConfig, appRoot, onPort, getAutostart }) {
   const rendererDir = path.join(appRoot, 'src', 'renderer');
   const sharedDir = path.join(appRoot, 'src', 'shared');
 
@@ -108,6 +109,9 @@ export async function startServer({ db, readConfig, appRoot, onPort }) {
 
     if (pathname === '/api/meta') {
       const cfg = readConfig();
+      /** 読み取り専用。トレイの「Windows 起動時に実行する」の現在値 */
+      let autostart = false;
+      try { autostart = getAutostart ? getAutostart() === true : false; } catch { autostart = false; }
       sendJson(res, 200, {
         providers: ['claude', 'codex'],
         windows: ['5h', 'weekly'],
@@ -115,6 +119,7 @@ export async function startServer({ db, readConfig, appRoot, onPort }) {
         now: Date.now(),
         dbPath: db.dbPath,
         backend: db.backend,
+        autostart,
       });
       return;
     }
