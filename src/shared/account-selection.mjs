@@ -22,3 +22,17 @@ export function chooseAccountSelection(group, savedAccountKey) {
   const unknown = accounts.find((account) => account.kind === 'unknown');
   return unknown?.accountKey ?? null;
 }
+
+/**
+ * listbox の確定操作が実際に表示アカウントを変えるかを判定する（アカウントメニュー設計書 §7.2）。
+ * active option の移動だけでは呼ばず、Enter・Space・click の確定時だけ呼ぶ。
+ * @param {string|null|undefined} currentAccountKey  現在の匿名 accountKey
+ * @param {string|null|undefined} nextAccountKey     確定しようとしている匿名 accountKey
+ * @returns {boolean} 切り替えが必要なら true
+ */
+export function isAccountSelectionChange(currentAccountKey, nextAccountKey) {
+  if (typeof nextAccountKey !== 'string' || nextAccountKey === '') {
+    return false;
+  }
+  return currentAccountKey !== nextAccountKey;
+}

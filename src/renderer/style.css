@@ -7,6 +7,10 @@
   --text: #1f2933;
   --muted: #6b7280;
   --axis-label: #4b5563;
+  /* アカウントメニュー用の semantic token（アカウントメニュー設計書 §5.3）。 */
+  --menu-border: #8b93a0;
+  --menu-active-bg: #dbe6fb;
+  --focus-ring: #1d4ed8;
 }
 
 * {
@@ -138,27 +142,134 @@ body {
   min-width: 0;
 }
 
-.account-control label,
+.account-control-label,
+.account-status,
 .current-account-note {
   color: var(--muted);
   font-size: 11px;
 }
 
-.account-control select,
-.reveal-button {
+/* 閉じたトリガー。匿名ラベルだけを出し、省略記号で隠さない。 */
+.account-trigger {
   min-width: 0;
   max-width: 100%;
-  border: 1px solid var(--panel-border);
+  border: 1px solid var(--menu-border);
   border-radius: 4px;
   background: var(--panel-bg);
   color: var(--text);
   font: inherit;
   font-size: 12px;
-  padding: 2px 5px;
+  padding: 2px 22px 2px 7px;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+  position: relative;
 }
 
-.reveal-button {
+.account-trigger::after {
+  content: "";
+  position: absolute;
+  right: 7px;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  margin-top: -4px;
+  border-right: 1.5px solid var(--muted);
+  border-bottom: 1.5px solid var(--muted);
+  transform: rotate(45deg);
+}
+
+.account-trigger[disabled] {
+  color: var(--muted);
+  cursor: default;
+}
+
+.account-trigger:focus-visible,
+.account-listbox:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* 開いた listbox。閉じるときは hidden にせず remove する。 */
+.account-listbox {
+  position: fixed;
+  z-index: 40;
+  margin: 2px 0 0;
+  padding: 3px;
+  border: 1px solid var(--menu-border);
+  border-radius: 6px;
+  background: var(--panel-bg);
+  color: var(--text);
+  box-shadow: 0 8px 24px rgb(15 23 42 / 18%);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.account-option {
+  display: grid;
+  grid-template-columns: max-content minmax(0, auto) minmax(0, 1fr) max-content;
+  align-items: baseline;
+  gap: 0 6px;
+  padding: 4px 7px;
+  border-radius: 4px;
+  font-size: 12px;
   cursor: pointer;
+}
+
+.account-option.is-active {
+  background: var(--menu-active-bg);
+}
+
+.account-option-label {
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.account-option-dash {
+  color: var(--muted);
+}
+
+/* 長いメールだけを折り返し、省略記号で全文を隠さない。 */
+.account-option-identifier {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.account-option-current {
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.account-option[aria-selected="true"] .account-option-label::before {
+  content: "✓ ";
+}
+
+@media (forced-colors: active) {
+  .account-trigger,
+  .account-listbox {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+  .account-option-dash,
+  .account-option-identifier,
+  .account-option-current {
+    color: CanvasText;
+  }
+  .account-option.is-active {
+    background: Highlight;
+    color: HighlightText;
+  }
+  .account-option.is-active .account-option-dash,
+  .account-option.is-active .account-option-identifier,
+  .account-option.is-active .account-option-current {
+    color: HighlightText;
+  }
+  .account-trigger:focus-visible,
+  .account-listbox:focus-visible {
+    outline: 2px solid Highlight;
+  }
 }
 
 .provider-chart-grid {
@@ -269,33 +380,6 @@ body {
   .provider-chart-grid {
     grid-template-columns: minmax(0, 1fr);
   }
-}
-
-/* ---------- 実 ID 確認 ---------- */
-
-.identifier-dialog {
-  max-width: min(520px, calc(100vw - 32px));
-  border: 1px solid var(--panel-border);
-  border-radius: 8px;
-  color: var(--text);
-  padding: 18px;
-}
-
-.identifier-dialog::backdrop {
-  background: rgb(0 0 0 / 35%);
-}
-
-.identifier-dialog h2 {
-  margin: 0 0 10px;
-  font-size: 15px;
-}
-
-.identifier-values {
-  overflow-wrap: anywhere;
-}
-
-.identifier-values p {
-  margin: 6px 0;
 }
 
 /* ---------- フッタ ---------- */

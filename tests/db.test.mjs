@@ -290,3 +290,63 @@ test('v1 縮退モードでも範囲外の直前と直後を返す', { skip }, (
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('listAccountIdentifiers は alias 順にメール優先・UUID fallback で返す', { skip }, () => {
+  withDb((db) => {
+    const claudeEmail = 'first@example.test';
+    const claudeUuid = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const codexEmail = 'codex@example.test';
+    db.recordPoll([{ provider: 'claude', identity: { provider: 'claude', uuid: null, email: claudeEmail, source: 'test' }, samples: [sample(0)] }]);
+    db.recordPoll([{ provider: 'claude', identity: { provider: 'claude', uuid: claudeUuid, email: null, source: 'test' }, samples: [sample(1)] }]);
+    db.recordPoll([{ provider: 'codex', identity: { provider: 'codex', uuid: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', email: codexEmail, source: 'test' }, samples: [sample(2, { provider: 'codex' })] }]);
+
+    const identifiers = db.listAccountIdentifiers();
+    assert.deepEqual(identifiers, [
+      { provider: 'claude', accountKey: 'claude:1', kind: 'email', value: claudeEmail },
+      { provider: 'claude', accountKey: 'claude:2', kind: 'uuid', value: claudeUuid },
+      { provider: 'codex', accountKey: 'codex:1', kind: 'email', value: codexEmail },
+    ]);
+    // provider 間で alias number 1 が重なっても混同しない。
+    assert.equal(identifiers.filter((row) => row.accountKey.endsWith(':1')).length, 2);
+    // メールがある行は UUID を返さない。
+    assert.equal(JSON.stringify(identifiers).includes('bbbbbbbb'), false);
+    // 旧単件 API は廃止済み。
+    assert.equal(db.accountIdentifier, undefined);
+  });
+});
+
+test('listAccountIdentifiers は UUID もメールも無い行を返さない', { skip }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-trail-identifiers-'));
+  const file = path.join(dir, 'identifiers.sqlite');
+  try {
+    const db = openDb(file);
+    db.recordPoll([{ provider: 'claude', identity: { provider: 'claude', uuid: null, email: 'only@example.test', source: 'test' }, samples: [sample(0)] }]);
+    const raw = new (createRequire(import.meta.url)('node:sqlite').DatabaseSync)(file);
+    raw.prepare('INSERT INTO accounts (provider, account_uuid, email, alias_no, identity_source, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run('claude', null, null, 9, 'broken', t0, t0);
+    raw.prepare('INSERT INTO accounts (provider, account_uuid, email, alias_no, identity_source, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run('claude', '', '', 10, 'broken', t0, t0);
+    raw.close();
+    assert.deepEqual(db.listAccountIdentifiers(), [
+      { provider: 'claude', accountKey: 'claude:1', kind: 'email', value: 'only@example.test' },
+    ]);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v1 縮退では listAccountIdentifiers が空配列を返す', { skip }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-trail-identifiers-v1-'));
+  const file = path.join(dir, 'fallback.sqlite');
+  try {
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+    const raw = new DatabaseSync(file);
+    raw.exec('CREATE TABLE schema_version (version INTEGER NOT NULL); INSERT INTO schema_version VALUES (1); CREATE TABLE samples (id INTEGER PRIMARY KEY, observed_at INTEGER NOT NULL, provider TEXT NOT NULL, win TEXT NOT NULL, used_percent REAL, resets_at INTEGER, status TEXT NOT NULL, error_code TEXT, interval_sec INTEGER NOT NULL); CREATE VIEW accounts AS SELECT 1 AS id;');
+    raw.close();
+    const db = openDb(file);
+    assert.equal(db.accountDimensionAvailable, false);
+    assert.deepEqual(db.listAccountIdentifiers(), []);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

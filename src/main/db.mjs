@@ -398,13 +398,33 @@ function createDbApi(raw, backend, file, accountDimensionAvailable) {
       return raw.prepare('SELECT 1 AS found FROM samples WHERE provider = ? AND account_id IS NULL LIMIT 1').all(provider).length > 0;
     },
 
-    /** @param {string} provider @param {number} accountId @returns {{uuid:string|null, email:string|null}|null} */
-    accountIdentifier(provider, accountId) {
-      if (!accountDimensionAvailable || !Number.isInteger(accountId)) {
-        return null;
+    /**
+     * 全 account の表示用識別情報を alias 順で返す（設計書 §3.4）。
+     * メールを優先し、メールが無い行だけ UUID を返す。
+     * UUID もメールも無い行、および v1 縮退時は返さない。
+     * @returns {{provider:string, accountKey:string, kind:'email'|'uuid', value:string}[]}
+     */
+    listAccountIdentifiers() {
+      if (!accountDimensionAvailable) {
+        return [];
       }
-      const row = raw.prepare('SELECT account_uuid, email FROM accounts WHERE provider = ? AND id = ?').all(provider, accountId)[0];
-      return row ? { uuid: row.account_uuid ?? null, email: row.email ?? null } : null;
+      const rows = raw.prepare('SELECT provider, alias_no, account_uuid, email FROM accounts ORDER BY provider, alias_no').all();
+      /** @type {{provider:string, accountKey:string, kind:'email'|'uuid', value:string}[]} */
+      const out = [];
+      for (const row of rows) {
+        const email = typeof row.email === 'string' && row.email !== '' ? row.email : null;
+        const uuid = typeof row.account_uuid === 'string' && row.account_uuid !== '' ? row.account_uuid : null;
+        if (email === null && uuid === null) {
+          continue;
+        }
+        out.push({
+          provider: String(row.provider),
+          accountKey: `${row.provider}:${row.alias_no}`,
+          kind: email === null ? 'uuid' : 'email',
+          value: email === null ? uuid : email,
+        });
+      }
+      return out;
     },
 
     /** @param {string} provider @param {unknown} accountKey @returns {number|null|'invalid'} */

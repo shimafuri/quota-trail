@@ -1,16 +1,30 @@
 /**
  * ダッシュボードの状態管理・データ取得・イベント処理（設計書 §7）。
+ * アカウントメニューは匿名トリガーとカスタム listbox で構成する（アカウントメニュー設計書 §2 / §4 / §6）。
+ * 実 ID は専用メモリキャッシュと、開いている listbox の option text node にだけ存在させる。
  * @module renderer/app
  */
 
 import { computeGaps } from '/shared/gaps.mjs';
 import { formatDateTime, formatClockLabel } from '/shared/ticks.mjs';
-import { chooseAccountSelection } from '/shared/account-selection.mjs';
+import { chooseAccountSelection, isAccountSelectionChange } from '/shared/account-selection.mjs';
+import {
+  ACCOUNT_DIMENSION_UNAVAILABLE_TEXT,
+  IDENTIFIER_PREPARING_TEXT,
+  buildAccountMenuRows,
+  buildClosedTriggerLabel,
+  computeMenuPlacement,
+  findTypeaheadIndex,
+  isAnchorVisible,
+  moveActiveIndex,
+  updateTypeaheadBuffer,
+} from '/shared/account-menu.mjs';
 import { SERIES, SERIES_KEYS } from './theme.mjs';
 import { drawChart, xToTime, nearestSample } from './chart.mjs';
 
 /** @typedef {import('/shared/gaps.mjs').Sample} Sample */
 /** @typedef {import('./theme.mjs').SeriesKey} SeriesKey */
+/** @typedef {import('/shared/account-menu.mjs').AccountMenuRow} AccountMenuRow */
 
 const STORAGE_KEY = 'quota-trail.ui.v2';
 const LEGACY_STORAGE_KEY = 'quota-trail.ui.v1';
@@ -19,6 +33,15 @@ const MIN_RANGE_MS = 60 * 1000;
 const GAP_FACTOR = 2.5;
 const FOLLOW_INTERVAL_MS = 60_000;
 const FETCH_DEBOUNCE_MS = 150;
+
+/** 実 ID の先読みを待つ上限（アカウントメニュー設計書 §3.6）。 */
+const IDENTIFIER_PREFETCH_TIMEOUT_MS = 2_000;
+
+/** 取得に失敗したとき直前の成功値を使い続けてよい上限（アカウントメニュー設計書 §3.6）。 */
+const IDENTIFIER_STALE_LIMIT_MS = 5 * 60 * 1000;
+
+/** 実 ID batch endpoint が要求するヘッダ名（アカウントメニュー設計書 §3.2）。 */
+const IDENTIFIER_TOKEN_HEADER = 'X-Quota-Trail-Identifier-Token';
 
 const PERIODS = /** @type {const} */ ([
   ['24h', '24時間', 24 * 60 * 60 * 1000],
@@ -47,8 +70,9 @@ const state = {
   selectedAccounts: { claude: null, codex: null },
   /** @type {Record<string, string>} */
   savedSelections: {},
-  /** @type {{pollIntervalSec:number,backend:string,accountDimensionAvailable:boolean,canRevealAccountIdentifiers:boolean}|null} */
+  /** @type {{pollIntervalSec:number,backend:string,accountDimensionAvailable:boolean,canRevealAccountIdentifiersInAccountMenu:boolean}|null} */
   meta: null,
+  accountsAvailable: true,
   decimated: false,
   error: null,
 };
@@ -59,19 +83,31 @@ for (const key of SERIES_KEYS) {
   state.latest[key] = null;
 }
 
+/**
+ * アカウントメニュー 1 つ分の controller。
+ * `rows` は listbox が開いている間だけ実 ID を含み、閉じるときに捨てる。
+ * @typedef {Object} AccountMenu
+ * @property {string} provider
+ * @property {HTMLButtonElement} button
+ * @property {HTMLElement} status
+ * @property {string} labelId
+ * @property {string} listboxId
+ * @property {HTMLElement|null} listbox
+ * @property {AccountMenuRow[]} rows
+ * @property {number} activeIndex
+ * @property {string} typeaheadBuffer
+ * @property {number} typeaheadAt
+ * @property {(() => void)|null} detach
+ */
+
 /** @type {Panel[]} */
 const panels = [];
-/** @type {Record<string, HTMLSelectElement>} */
-const accountSelects = {};
+/** @type {Record<string, AccountMenu>} */
+const accountMenus = {};
 /** @type {Record<string, HTMLElement>} */
 const currentAccountNotes = {};
-/** @type {Record<string, HTMLButtonElement>} */
-const revealButtons = {};
 /** @type {Record<string, HTMLElement>} */
 const providerGroups = {};
-/** @type {{dialog:HTMLDialogElement|null, controller:AbortController|null, opener:HTMLButtonElement|null}|null} */
-let activeIdentifierDialog = null;
-let revealGeneration = 0;
 
 // ---------------------------------------------------------------- 永続化
 
@@ -163,13 +199,15 @@ async function fetchMeta() {
       pollIntervalSec: json.pollIntervalSec,
       backend: String(json.backend ?? ''),
       accountDimensionAvailable: json.accountDimensionAvailable !== false,
-      canRevealAccountIdentifiers: json.canRevealAccountIdentifiers === true,
+      canRevealAccountIdentifiersInAccountMenu: json.canRevealAccountIdentifiersInAccountMenu === true,
     };
     if (Number.isFinite(json.now)) state.now = json.now;
-    if (!state.meta.canRevealAccountIdentifiers) discardIdentifierDialog();
+    if (!state.meta.canRevealAccountIdentifiersInAccountMenu) {
+      purgeIdentifierCache();
+    }
   } catch {
     state.meta = null;
-    discardIdentifierDialog();
+    purgeIdentifierCache();
   }
   renderFooter();
 }
@@ -188,21 +226,42 @@ async function fetchAccounts() {
   const response = await fetch('/api/accounts', { cache: 'no-store' });
   if (!response.ok) throw new Error('accounts');
   const json = await response.json();
-  if (json.available === false) {
-    state.accountGroups = {};
-    configureAccountSelectors(true);
+  // listbox を開いている間は account DTO の反映を保留する（アカウントメニュー設計書 §3.6）。
+  if (openMenuProvider !== null) {
+    pendingAccountsPayload = json;
     return;
   }
-  state.accountGroups = json.providers && typeof json.providers === 'object' ? json.providers : {};
-  if (Number.isFinite(json.now)) state.now = json.now;
+  applyAccountsPayload(json);
+}
+
+/**
+ * `/api/accounts` の匿名応答を画面へ反映する。
+ * nonce を受け取った時点で実 ID の先読みを始める（アカウントメニュー設計書 §3.6）。
+ * @param {any} json  `/api/accounts` の応答
+ * @returns {void}
+ */
+function applyAccountsPayload(json) {
+  if (json?.available === false) {
+    state.accountsAvailable = false;
+    state.accountGroups = {};
+    purgeIdentifierCache();
+    renderAccountControls();
+    return;
+  }
+  state.accountsAvailable = true;
+  state.accountGroups = json?.providers && typeof json.providers === 'object' ? json.providers : {};
+  if (Number.isFinite(json?.now)) state.now = json.now;
+  const token = typeof json?.identifierAccessToken === 'string' ? json.identifierAccessToken : null;
   const before = { ...state.selectedAccounts };
-  configureAccountSelectors(false);
+  chooseAccountSelections();
+  dropUnknownIdentifierKeys();
+  renderAccountControls();
   for (const provider of PROVIDERS) {
     if (before[provider] !== state.selectedAccounts[provider]) {
-      discardIdentifierDialog();
       clearProvider(provider);
     }
   }
+  updateIdentifierAccessToken(token);
   renderHeader();
   scheduleDraw();
 }
@@ -257,14 +316,14 @@ function clearProvider(provider) {
 
 /** @param {string} provider @param {string} key */
 function selectAccount(provider, key) {
-  if (state.selectedAccounts[provider] === key) return;
-  discardIdentifierDialog();
+  if (!isAccountSelectionChange(state.selectedAccounts[provider], key)) return;
   clearProvider(provider);
   state.selectedAccounts[provider] = key;
   state.savedSelections[provider] = key;
   savePrefs();
   fetchController?.abort();
   fetchSeq += 1;
+  renderAccountControls();
   renderHeader();
   scheduleDraw();
   void fetchData();
@@ -352,22 +411,43 @@ function buildProviderGroup(provider) {
   const heading = el('h2', undefined, title);
   heading.id = headingId;
   const accountControl = el('div', 'account-control');
-  const selectId = `${provider}-account`;
-  const label = el('label', undefined, '表示アカウント:');
-  label.htmlFor = selectId;
-  const select = /** @type {HTMLSelectElement} */ (document.createElement('select'));
-  select.id = selectId;
-  select.addEventListener('change', () => selectAccount(provider, select.value));
+  const labelId = `${provider}-account-label`;
+  const listboxId = `${provider}-account-listbox`;
+  const buttonId = `${provider}-account-trigger`;
+  const label = el('label', 'account-control-label', '表示アカウント:');
+  label.id = labelId;
+  // 閉じたトリガーは匿名 button であり、実 ID を持つ DOM は一切作らない。
+  const button = /** @type {HTMLButtonElement} */ (document.createElement('button'));
+  button.type = 'button';
+  button.id = buttonId;
+  button.className = 'account-trigger';
+  button.disabled = true;
+  button.setAttribute('aria-haspopup', 'listbox');
+  button.setAttribute('aria-expanded', 'false');
+  button.setAttribute('aria-controls', listboxId);
+  button.setAttribute('aria-labelledby', `${labelId} ${buttonId}`);
+  const status = el('span', 'account-status');
+  status.setAttribute('aria-live', 'polite');
   const currentNote = el('span', 'current-account-note');
   currentNote.setAttribute('aria-live', 'polite');
-  const reveal = /** @type {HTMLButtonElement} */ (document.createElement('button'));
-  reveal.type = 'button';
-  reveal.className = 'reveal-button';
-  reveal.textContent = '実IDを確認';
-  reveal.hidden = true;
-  reveal.addEventListener('click', () => { void revealIdentifier(provider, reveal); });
-  accountControl.append(label, select, currentNote, reveal);
+  accountControl.append(label, button, status, currentNote);
   header.append(heading, accountControl);
+  accountMenus[provider] = {
+    provider,
+    button,
+    status,
+    labelId,
+    listboxId,
+    listbox: null,
+    rows: [],
+    activeIndex: -1,
+    typeaheadBuffer: '',
+    typeaheadAt: 0,
+    detach: null,
+  };
+  button.addEventListener('click', () => toggleAccountMenu(provider));
+  button.addEventListener('keydown', (event) => onTriggerKeyDown(provider, event));
+  button.addEventListener('focus', () => { void retryIdentifiersIfNeeded(); });
   const chartGrid = el('div', 'provider-chart-grid');
   for (const key of SERIES_KEYS.filter((seriesKey) => seriesKey.startsWith(`${provider}/`))) {
     const panel = buildPanel(key);
@@ -375,119 +455,768 @@ function buildProviderGroup(provider) {
     chartGrid.appendChild(panel.root);
   }
   section.append(header, chartGrid);
-  accountSelects[provider] = select;
   currentAccountNotes[provider] = currentNote;
-  revealButtons[provider] = reveal;
   providerGroups[provider] = section;
   return section;
 }
 
-/** @param {boolean} unavailable */
-function configureAccountSelectors(unavailable) {
-  if (unavailable || !state.meta?.canRevealAccountIdentifiers) discardIdentifierDialog();
+// ---------------------------------------------------------------- 実 ID 専用キャッシュ
+
+/**
+ * 実 ID の専用メモリキャッシュ（アカウントメニュー設計書 §3.6 / §4.1）。
+ * 中央の `state`、panel state、永続化対象からは完全に分離する。
+ * 鍵は匿名 `accountKey` だけとする。
+ * @type {Map<string, {kind:'email'|'uuid', value:string}>}
+ */
+const identifierCache = new Map();
+
+/** 直近に成功した batch 取得の時刻。 */
+let identifierUpdatedAt = 0;
+
+/** 一度でも batch 取得に成功したか。 */
+let identifiersLoaded = false;
+
+/** `/api/accounts` から受け取った process-scoped nonce。 */
+let identifierAccessToken = null;
+
+/** @type {AbortController|null} */
+let identifierController = null;
+
+/** 古い応答を捨てるための世代番号。 */
+let identifierFetchSeq = 0;
+
+/** 起動時先読みを始めたか。 */
+let identifierPrefetchStarted = false;
+
+/** 先読みが決着し、メニューを開いてよいか。 */
+let identifierReady = false;
+
+/** 先読みの 2 秒打ち切りタイマー。 */
+let identifierDeadlineTimer = 0;
+
+/** 現在開いている listbox の provider。一度に一つだけ開く。 */
+let openMenuProvider = null;
+
+/** listbox を開いている間に届いた `/api/accounts` の応答。 */
+let pendingAccountsPayload = null;
+
+/** listbox を開いている間に届いた実 ID batch の応答。 */
+let pendingIdentifierPayload = null;
+
+/**
+ * 実 ID キャッシュと nonce をすべて捨てる（アカウントメニュー設計書 §4.2 不変条件 11）。
+ * 設定無効化、account dimension の縮退、ページ unload で呼ぶ。
+ * @returns {void}
+ */
+function purgeIdentifierCache() {
+  identifierController?.abort();
+  identifierController = null;
+  identifierFetchSeq += 1;
+  identifierCache.clear();
+  identifierUpdatedAt = 0;
+  identifiersLoaded = false;
+  identifierAccessToken = null;
+  pendingIdentifierPayload = null;
+}
+
+/**
+ * `/api/accounts` が返した nonce を反映し、必要なら先読みを始める。
+ * @param {string|null} token  process-scoped nonce。設定無効時は null
+ * @returns {void}
+ */
+function updateIdentifierAccessToken(token) {
+  if (token === null || state.meta?.canRevealAccountIdentifiersInAccountMenu !== true) {
+    purgeIdentifierCache();
+    identifierReady = true;
+    renderAccountControls();
+    return;
+  }
+  identifierAccessToken = token;
+  if (!identifierPrefetchStarted) {
+    startIdentifierPrefetch();
+    return;
+  }
+  void refreshAccountIdentifiers();
+}
+
+/**
+ * 起動時の先読みを始める（アカウントメニュー設計書 §3.6）。
+ * 2 秒で決着しない場合は失敗扱いにして操作自体は可能にする。
+ * @returns {void}
+ */
+function startIdentifierPrefetch() {
+  identifierPrefetchStarted = true;
+  identifierDeadlineTimer = window.setTimeout(() => {
+    identifierDeadlineTimer = 0;
+    identifierReady = true;
+    renderAccountControls();
+  }, IDENTIFIER_PREFETCH_TIMEOUT_MS);
+  renderAccountControls();
+  void refreshAccountIdentifiers();
+}
+
+/**
+ * 先読みの待ちを解除する。
+ * @returns {void}
+ */
+function settleIdentifierPrefetch() {
+  if (identifierDeadlineTimer) {
+    clearTimeout(identifierDeadlineTimer);
+    identifierDeadlineTimer = 0;
+  }
+  identifierReady = true;
+  renderAccountControls();
+}
+
+/**
+ * 実 ID を batch で取得する（アカウントメニュー設計書 §3.2 / §3.6）。
+ * 失敗しても chart の取得結果には影響させない。
+ * @returns {Promise<void>}
+ */
+async function refreshAccountIdentifiers() {
+  if (!identifierAccessToken || state.meta?.canRevealAccountIdentifiersInAccountMenu !== true) {
+    settleIdentifierPrefetch();
+    return;
+  }
+  const sequence = ++identifierFetchSeq;
+  identifierController?.abort();
+  const controller = new AbortController();
+  identifierController = controller;
+  try {
+    const response = await fetch('/api/account-identifiers', {
+      cache: 'no-store',
+      signal: controller.signal,
+      headers: { [IDENTIFIER_TOKEN_HEADER]: identifierAccessToken },
+    });
+    if (!response.ok) {
+      throw new Error('identifiers');
+    }
+    const json = await response.json();
+    if (sequence !== identifierFetchSeq) {
+      return;
+    }
+    applyIdentifierPayload(json.providers);
+  } catch (error) {
+    if (sequence !== identifierFetchSeq || error?.name === 'AbortError') {
+      return;
+    }
+    // 一時的な失敗では直前の成功値を 5 分まで使い、超えたら捨てる。
+    expireStaleIdentifiers();
+  } finally {
+    if (sequence === identifierFetchSeq) {
+      settleIdentifierPrefetch();
+    }
+  }
+}
+
+/**
+ * batch 応答を専用キャッシュへ atomic に差し替える。
+ * listbox を開いている間は反映を保留する（アカウントメニュー設計書 §3.6）。
+ * @param {any} providers  provider ごとの実 ID
+ * @returns {void}
+ */
+function applyIdentifierPayload(providers) {
+  if (openMenuProvider !== null) {
+    pendingIdentifierPayload = providers;
+    return;
+  }
+  /** @type {[string, {kind:'email'|'uuid', value:string}][]} */
+  const entries = [];
   for (const provider of PROVIDERS) {
-    const select = accountSelects[provider];
-    const note = currentAccountNotes[provider];
-    const reveal = revealButtons[provider];
-    if (!select || !note || !reveal) continue;
-    select.textContent = '';
-    if (unavailable) {
-      const option = document.createElement('option');
-      option.textContent = 'アカウント情報を利用できません';
-      option.value = '';
-      select.appendChild(option);
-      select.disabled = true;
-      note.textContent = 'DB移行未完了のためアカウント別表示は無効';
-      reveal.hidden = true;
+    const rows = providers?.[provider];
+    if (!rows || typeof rows !== 'object') {
       continue;
     }
+    for (const [accountKey, entry] of Object.entries(rows)) {
+      if (!entry || typeof entry.value !== 'string' || entry.value === '') {
+        continue;
+      }
+      entries.push([accountKey, { kind: entry.kind === 'email' ? 'email' : 'uuid', value: entry.value }]);
+    }
+  }
+  identifierCache.clear();
+  for (const [accountKey, entry] of entries) {
+    identifierCache.set(accountKey, entry);
+  }
+  identifierUpdatedAt = Date.now();
+  identifiersLoaded = true;
+  pendingIdentifierPayload = null;
+}
+
+/**
+ * 5 分を超えた古い値を捨てる（アカウントメニュー設計書 §3.6）。
+ * @returns {void}
+ */
+function expireStaleIdentifiers() {
+  if (!identifiersLoaded) {
+    return;
+  }
+  if (Date.now() - identifierUpdatedAt <= IDENTIFIER_STALE_LIMIT_MS) {
+    return;
+  }
+  identifierCache.clear();
+  identifierUpdatedAt = 0;
+  identifiersLoaded = false;
+}
+
+/**
+ * `/api/accounts` から消えた account key を即時破棄する（アカウントメニュー設計書 §3.6）。
+ * @returns {void}
+ */
+function dropUnknownIdentifierKeys() {
+  const known = new Set();
+  for (const provider of PROVIDERS) {
+    for (const account of state.accountGroups[provider]?.accounts ?? []) {
+      known.add(account.accountKey);
+    }
+  }
+  for (const accountKey of [...identifierCache.keys()]) {
+    if (!known.has(accountKey)) {
+      identifierCache.delete(accountKey);
+    }
+  }
+}
+
+/**
+ * 識別情報の取得状態を返す。
+ * @returns {'ready'|'unavailable'|'disabled'} option へ出す文言の決め方
+ */
+function identifierState() {
+  if (state.meta?.canRevealAccountIdentifiersInAccountMenu !== true || !state.accountsAvailable) {
+    return 'disabled';
+  }
+  expireStaleIdentifiers();
+  return identifiersLoaded ? 'ready' : 'unavailable';
+}
+
+/**
+ * listbox を組み立てるときだけ使う、provider 分の実 ID スナップショット。
+ * @param {string} provider  provider 名
+ * @returns {Record<string, {kind:'email'|'uuid', value:string}>} accountKey を鍵にした実 ID
+ */
+function identifierSnapshot(provider) {
+  /** @type {Record<string, {kind:'email'|'uuid', value:string}>} */
+  const snapshot = {};
+  for (const account of state.accountGroups[provider]?.accounts ?? []) {
+    const entry = identifierCache.get(account.accountKey);
+    if (entry) {
+      snapshot[account.accountKey] = entry;
+    }
+  }
+  return snapshot;
+}
+
+/**
+ * まだ識別情報が揃っていなければ再取得する（アカウントメニュー設計書 §3.6）。
+ * メニューを開く操作とトリガーのフォーカス取得時に呼ぶ。
+ * @returns {Promise<void>}
+ */
+async function retryIdentifiersIfNeeded() {
+  if (identifierState() === 'ready' || !identifierAccessToken) {
+    return;
+  }
+  await refreshAccountIdentifiers();
+}
+
+// ---------------------------------------------------------------- 閉じたトリガー
+
+/**
+ * provider ごとの選択値を匿名 DTO から決め直す。
+ * @returns {void}
+ */
+function chooseAccountSelections() {
+  for (const provider of PROVIDERS) {
     const group = state.accountGroups[provider] ?? { resolution: 'pending', currentAccountKey: null, accounts: [] };
-    const selected = chooseAccountSelection(group, state.savedSelections[provider]);
-    state.selectedAccounts[provider] = selected;
-    for (const account of group.accounts ?? []) {
-      const option = document.createElement('option');
-      option.value = account.accountKey;
-      option.textContent = account.isCurrent ? `${account.label}（現在ログイン中）` : account.label;
-      select.appendChild(option);
-    }
-    if (select.options.length === 0) {
-      const option = document.createElement('option');
-      option.value = '';
-      option.textContent = 'アカウントを確認中';
-      select.appendChild(option);
-    }
-    select.disabled = !selected;
-    select.value = selected ?? '';
-    const current = (group.accounts ?? []).find((account) => account.accountKey === group.currentAccountKey);
-    note.textContent = current && selected !== current.accountKey ? `現在ログイン中: ${current.label}` : '';
-    reveal.hidden = !(state.meta?.canRevealAccountIdentifiers && selected && !selected.endsWith(':unknown'));
+    state.selectedAccounts[provider] = chooseAccountSelection(group, state.savedSelections[provider]);
   }
 }
 
-// ---------------------------------------------------------------- 実 ID 確認
+/**
+ * 閉じたトリガーの text node を作る（アカウントメニュー設計書 §4.2 不変条件 1・2）。
+ * 入力は匿名 `/api/accounts` DTO の `label` だけであり、実 ID キャッシュは参照しない。
+ * current marker も付けない。
+ * @param {string} provider  provider 名
+ * @returns {void}
+ */
+function renderAccountTrigger(provider) {
+  const menu = accountMenus[provider];
+  if (!menu) {
+    return;
+  }
+  const group = state.accountGroups[provider] ?? null;
+  menu.button.textContent = buildClosedTriggerLabel(group, state.selectedAccounts[provider]);
+}
 
-/** 設定変更・meta 失敗・世代変更時に実 ID の request と DOM を破棄する。 */
-function discardIdentifierDialog() {
-  revealGeneration += 1;
-  const active = activeIdentifierDialog;
-  activeIdentifierDialog = null;
-  active?.controller?.abort();
-  if (active?.dialog) {
-    try {
-      active.dialog.close();
-    } catch {
-      active.dialog.remove();
-    }
-    active.dialog.remove();
+/**
+ * 全 provider のアカウント操作部を描き直す。
+ * @returns {void}
+ */
+function renderAccountControls() {
+  for (const provider of PROVIDERS) {
+    renderAccountControl(provider);
   }
 }
 
-/** @param {string} provider @param {HTMLButtonElement} opener */
-async function revealIdentifier(provider, opener) {
-  const account = state.selectedAccounts[provider];
-  if (!account || !window.confirm('選択中のアカウントの実IDを確認しますか？')) return;
-  discardIdentifierDialog();
-  const generation = revealGeneration;
-  const controller = new AbortController();
-  activeIdentifierDialog = { dialog: null, controller, opener };
-  try {
-    const query = new URLSearchParams({ provider, account });
-    const response = await fetch(`/api/account-identifier?${query}`, { cache: 'no-store', signal: controller.signal });
-    if (!response.ok) throw new Error('identifier');
-    const json = await response.json();
-    if (generation !== revealGeneration || !state.meta?.canRevealAccountIdentifiers) return;
-    showIdentifierDialog(json.account, opener, controller);
-  } catch {
-    /* 実 ID が無い失敗を通常画面には出さない。 */
-  } finally {
-    if (generation === revealGeneration && activeIdentifierDialog?.dialog === null) {
-      activeIdentifierDialog = null;
-    }
+/**
+ * 1 provider 分のトリガー、status、current note を描き直す。
+ * @param {string} provider  provider 名
+ * @returns {void}
+ */
+function renderAccountControl(provider) {
+  const menu = accountMenus[provider];
+  const note = currentAccountNotes[provider];
+  if (!menu || !note) {
+    return;
+  }
+  if (!state.accountsAvailable) {
+    // migration 縮退では listbox を開かず、実 ID endpoint も呼ばない。
+    menu.button.textContent = ACCOUNT_DIMENSION_UNAVAILABLE_TEXT;
+    menu.button.disabled = true;
+    menu.status.textContent = '';
+    note.textContent = 'DB移行未完了のためアカウント別表示は無効';
+    return;
+  }
+  renderAccountTrigger(provider);
+  const group = state.accountGroups[provider] ?? { currentAccountKey: null, accounts: [] };
+  const selected = state.selectedAccounts[provider];
+  const waiting = Boolean(selected) && !identifierReady;
+  menu.button.disabled = !selected || waiting;
+  menu.status.textContent = waiting ? IDENTIFIER_PREPARING_TEXT : '';
+  const current = (group.accounts ?? []).find((account) => account.accountKey === group.currentAccountKey);
+  note.textContent = current && selected !== current.accountKey ? `現在ログイン中: ${current.label}` : '';
+}
+
+/**
+ * listbox を閉じている間に溜めた更新を反映する（アカウントメニュー設計書 §3.6 / §7.3）。
+ * @returns {void}
+ */
+function applyPendingAccountUpdates() {
+  if (openMenuProvider !== null) {
+    return;
+  }
+  const identifiers = pendingIdentifierPayload;
+  pendingIdentifierPayload = null;
+  if (identifiers) {
+    applyIdentifierPayload(identifiers);
+  }
+  const accounts = pendingAccountsPayload;
+  pendingAccountsPayload = null;
+  if (accounts) {
+    applyAccountsPayload(accounts);
   }
 }
 
-/** @param {{uuid?:string|null,email?:string|null}} account @param {HTMLButtonElement} opener @param {AbortController} controller */
-function showIdentifierDialog(account, opener, controller) {
-  const dialog = /** @type {HTMLDialogElement} */ (document.createElement('dialog'));
-  dialog.className = 'identifier-dialog';
-  const title = el('h2', undefined, '実IDの確認');
-  const body = el('div', 'identifier-values');
-  body.appendChild(el('p', undefined, account.uuid || 'UUID はありません'));
-  body.appendChild(el('p', undefined, account.email || 'メールアドレスはありません'));
-  const close = /** @type {HTMLButtonElement} */ (document.createElement('button'));
-  close.type = 'button';
-  close.textContent = '閉じる';
-  const dispose = () => {
-    dialog.remove();
-    if (activeIdentifierDialog?.dialog === dialog) activeIdentifierDialog = null;
-    opener.focus();
+// ---------------------------------------------------------------- listbox
+
+/**
+ * トリガーの click で listbox を開閉する。
+ * @param {string} provider  provider 名
+ * @returns {void}
+ */
+function toggleAccountMenu(provider) {
+  if (openMenuProvider === provider) {
+    closeAccountMenu(provider, { focusTrigger: true });
+    return;
+  }
+  openAccountMenu(provider, 'selected');
+}
+
+/**
+ * listbox を組み立てて `document.body` 直下へ追加する（アカウントメニュー設計書 §2.4 / §6）。
+ * 実 ID を含む DOM node はこの関数でだけ作る。
+ * @param {string} provider  provider 名
+ * @param {'selected'|'next'|'previous'|'first'|'last'} initial  開いた直後の active option
+ * @returns {void}
+ */
+function openAccountMenu(provider, initial) {
+  const menu = accountMenus[provider];
+  if (!menu || menu.button.disabled || !state.accountsAvailable) {
+    return;
+  }
+  if (openMenuProvider !== null && openMenuProvider !== provider) {
+    closeAccountMenu(openMenuProvider, { focusTrigger: false });
+  }
+  if (openMenuProvider === provider) {
+    return;
+  }
+  void retryIdentifiersIfNeeded();
+  const rows = buildAccountMenuRows({
+    provider,
+    accounts: state.accountGroups[provider]?.accounts ?? [],
+    identifiers: identifierSnapshot(provider),
+    identifierState: identifierState(),
+    selectedAccountKey: state.selectedAccounts[provider],
+  });
+  if (rows.length === 0) {
+    return;
+  }
+  menu.rows = rows;
+  menu.typeaheadBuffer = '';
+  menu.typeaheadAt = 0;
+  const selectedIndex = Math.max(0, rows.findIndex((row) => row.isSelected));
+  menu.activeIndex = initialActiveIndex(initial, selectedIndex, rows.length);
+
+  const listbox = el('div', 'account-listbox');
+  listbox.id = menu.listboxId;
+  listbox.setAttribute('role', 'listbox');
+  listbox.tabIndex = 0;
+  listbox.setAttribute('aria-labelledby', menu.labelId);
+  rows.forEach((row, index) => {
+    listbox.appendChild(buildAccountOption(provider, row, index));
+  });
+  document.body.appendChild(listbox);
+  menu.listbox = listbox;
+  openMenuProvider = provider;
+  menu.button.setAttribute('aria-expanded', 'true');
+  placeAccountMenu(menu);
+  if (!menu.listbox) {
+    // anchor が画面外だった場合は placeAccountMenu が既に閉じている。
+    return;
+  }
+  attachAccountMenuListeners(menu);
+  listbox.focus();
+  setActiveIndex(provider, menu.activeIndex);
+}
+
+/**
+ * 開いた直後の active index を決める（アカウントメニュー設計書 §6.2）。
+ * @param {'selected'|'next'|'previous'|'first'|'last'} initial  開き方
+ * @param {number} selectedIndex  選択中の index
+ * @param {number} count  行数
+ * @returns {number} active index
+ */
+function initialActiveIndex(initial, selectedIndex, count) {
+  if (initial === 'next') {
+    return moveActiveIndex(selectedIndex, 'down', count);
+  }
+  if (initial === 'previous') {
+    return moveActiveIndex(selectedIndex, 'up', count);
+  }
+  if (initial === 'first') {
+    return moveActiveIndex(selectedIndex, 'home', count);
+  }
+  if (initial === 'last') {
+    return moveActiveIndex(selectedIndex, 'end', count);
+  }
+  return selectedIndex;
+}
+
+/**
+ * option の DOM を作る。
+ * 実 ID は可視 text node にだけ置き、`title`・`data-*`・`aria-label` へは複製しない。
+ * @param {string} provider  provider 名
+ * @param {AccountMenuRow} row  行モデル
+ * @param {number} index  行の位置
+ * @returns {HTMLElement} option 要素
+ */
+function buildAccountOption(provider, row, index) {
+  const option = el('div', 'account-option');
+  option.id = row.optionId;
+  option.setAttribute('role', 'option');
+  option.setAttribute('aria-selected', row.isSelected ? 'true' : 'false');
+  option.appendChild(el('span', 'account-option-label', row.label));
+  if (row.identifierText !== '') {
+    const dash = el('span', 'account-option-dash', '—');
+    dash.setAttribute('aria-hidden', 'true');
+    option.appendChild(dash);
+    option.appendChild(el('span', 'account-option-identifier', row.identifierText));
+  }
+  option.appendChild(el('span', 'account-option-current', row.currentText));
+  option.addEventListener('pointerenter', () => setActiveIndex(provider, index));
+  option.addEventListener('click', (event) => {
+    if (event.button !== 0) {
+      return;
+    }
+    commitAccountMenu(provider, index);
+  });
+  return option;
+}
+
+/**
+ * listbox を viewport 内へ配置する（アカウントメニュー設計書 §5.2）。
+ * @param {AccountMenu} menu  対象の controller
+ * @returns {void}
+ */
+function placeAccountMenu(menu) {
+  const listbox = menu.listbox;
+  if (!listbox) {
+    return;
+  }
+  const viewport = { width: document.documentElement.clientWidth, height: document.documentElement.clientHeight };
+  const anchor = menu.button.getBoundingClientRect();
+  if (!isAnchorVisible(anchor, viewport)) {
+    closeAccountMenu(menu.provider, { focusTrigger: false });
+    return;
+  }
+  // 幅は内容高に依存しないため、先に幅だけ決めて内容高を測る。
+  const first = computeMenuPlacement({ anchor, viewport });
+  listbox.style.width = `${first.width}px`;
+  listbox.style.maxHeight = 'none';
+  const contentHeight = listbox.scrollHeight;
+  const placement = computeMenuPlacement({ anchor, viewport, contentHeight });
+  listbox.style.width = `${placement.width}px`;
+  listbox.style.maxHeight = `${placement.maxHeight}px`;
+  listbox.style.left = `${Math.round(placement.left)}px`;
+  listbox.style.top = `${Math.round(placement.top)}px`;
+}
+
+/**
+ * listbox を開いている間だけ必要な listener を張る（アカウントメニュー設計書 §6.3）。
+ * @param {AccountMenu} menu  対象の controller
+ * @returns {void}
+ */
+function attachAccountMenuListeners(menu) {
+  const provider = menu.provider;
+  const onKeyDown = (event) => onListboxKeyDown(provider, event);
+  const onPointerDown = (event) => {
+    if (menu.listbox?.contains(event.target) || menu.button.contains(event.target)) {
+      return;
+    }
+    // 外側クリックでは閉じるだけとし、クリック先の操作は妨げない。
+    closeAccountMenu(provider, { focusTrigger: false });
   };
-  close.addEventListener('click', () => dialog.close());
-  dialog.addEventListener('close', dispose, { once: true });
-  dialog.append(title, body, close);
-  document.body.appendChild(dialog);
-  activeIdentifierDialog = { dialog, controller, opener };
-  dialog.showModal();
+  const onWindowBlur = () => closeAccountMenu(provider, { focusTrigger: false });
+  const onReposition = () => placeAccountMenu(menu);
+  menu.listbox?.addEventListener('keydown', onKeyDown);
+  document.addEventListener('pointerdown', onPointerDown, true);
+  window.addEventListener('blur', onWindowBlur);
+  window.addEventListener('resize', onReposition);
+  window.addEventListener('scroll', onReposition, true);
+  menu.detach = () => {
+    menu.listbox?.removeEventListener('keydown', onKeyDown);
+    document.removeEventListener('pointerdown', onPointerDown, true);
+    window.removeEventListener('blur', onWindowBlur);
+    window.removeEventListener('resize', onReposition);
+    window.removeEventListener('scroll', onReposition, true);
+  };
+}
+
+/**
+ * listbox を閉じる（アカウントメニュー設計書 §4.2 不変条件 3・4）。
+ * 実 ID を含む node は `hidden` にせず remove し、行モデルも同時に捨てる。
+ * @param {string} provider  provider 名
+ * @param {{focusTrigger?:boolean}} [options]  トリガーへフォーカスを戻すか
+ * @returns {void}
+ */
+function closeAccountMenu(provider, { focusTrigger = true } = {}) {
+  const menu = accountMenus[provider];
+  if (!menu || !menu.listbox) {
+    return;
+  }
+  menu.detach?.();
+  menu.detach = null;
+  menu.listbox.remove();
+  menu.listbox = null;
+  menu.rows = [];
+  menu.activeIndex = -1;
+  menu.typeaheadBuffer = '';
+  menu.typeaheadAt = 0;
+  menu.button.setAttribute('aria-expanded', 'false');
+  if (openMenuProvider === provider) {
+    openMenuProvider = null;
+  }
+  if (focusTrigger && !menu.button.disabled) {
+    menu.button.focus();
+  }
+  applyPendingAccountUpdates();
+}
+
+/**
+ * active option を移す（アカウントメニュー設計書 §6.1）。
+ * selected とは別状態であり、ここでは account を切り替えない。
+ * @param {string} provider  provider 名
+ * @param {number} index  新しい active index
+ * @returns {void}
+ */
+function setActiveIndex(provider, index) {
+  const menu = accountMenus[provider];
+  const listbox = menu?.listbox;
+  if (!menu || !listbox) {
+    return;
+  }
+  const next = Math.min(Math.max(index, 0), menu.rows.length - 1);
+  menu.activeIndex = next;
+  const options = listbox.children;
+  for (let position = 0; position < options.length; position += 1) {
+    options[position].classList.toggle('is-active', position === next);
+  }
+  const active = /** @type {HTMLElement|undefined} */ (options[next]);
+  if (!active) {
+    return;
+  }
+  listbox.setAttribute('aria-activedescendant', active.id);
+  active.scrollIntoView({ block: 'nearest' });
+}
+
+/**
+ * active option を確定する（アカウントメニュー設計書 §7.2）。
+ * listbox を先に remove してから clear と再取得を行う。
+ * @param {string} provider  provider 名
+ * @param {number} index  確定する行の位置
+ * @returns {void}
+ */
+function commitAccountMenu(provider, index) {
+  const menu = accountMenus[provider];
+  const accountKey = menu?.rows[index]?.accountKey ?? null;
+  closeAccountMenu(provider, { focusTrigger: true });
+  if (accountKey) {
+    selectAccount(provider, accountKey);
+  }
+}
+
+// ---------------------------------------------------------------- キーボード
+
+/**
+ * typeahead として扱う文字入力かどうかを判定する。
+ * @param {KeyboardEvent} event  キーイベント
+ * @returns {boolean} typeahead なら true
+ */
+function isTypeaheadKey(event) {
+  if (event.ctrlKey || event.metaKey || event.altKey) {
+    return false;
+  }
+  return typeof event.key === 'string' && event.key.length === 1 && event.key !== ' ';
+}
+
+/**
+ * キーから active option の移動種別を求める。
+ * @param {KeyboardEvent} event  キーイベント
+ * @returns {'up'|'down'|'home'|'end'|'pageup'|'pagedown'|null} 移動種別
+ */
+function moveActionForKey(event) {
+  if (event.key === 'ArrowDown') {
+    return 'down';
+  }
+  if (event.key === 'ArrowUp') {
+    return 'up';
+  }
+  if (event.key === 'Home') {
+    return 'home';
+  }
+  if (event.key === 'End') {
+    return 'end';
+  }
+  if (event.key === 'PageDown') {
+    return 'pagedown';
+  }
+  if (event.key === 'PageUp') {
+    return 'pageup';
+  }
+  return null;
+}
+
+/**
+ * PageUp / PageDown の移動量を可視 option 数から求める。
+ * @param {AccountMenu} menu  対象の controller
+ * @returns {number} 1 回で動かす行数
+ */
+function visibleOptionCount(menu) {
+  const listbox = menu.listbox;
+  const first = /** @type {HTMLElement|undefined} */ (listbox?.children[0]);
+  if (!listbox || !first || first.offsetHeight === 0) {
+    return 1;
+  }
+  return Math.max(1, Math.floor(listbox.clientHeight / first.offsetHeight));
+}
+
+/**
+ * 閉じたトリガー上のキー操作（アカウントメニュー設計書 §6.2）。
+ * @param {string} provider  provider 名
+ * @param {KeyboardEvent} event  キーイベント
+ * @returns {void}
+ */
+function onTriggerKeyDown(provider, event) {
+  if (event.key === 'Enter' || event.key === ' ' || event.key === 'F4' || (event.altKey && event.key === 'ArrowDown')) {
+    event.preventDefault();
+    openAccountMenu(provider, 'selected');
+    return;
+  }
+  if (event.key === 'ArrowDown') {
+    event.preventDefault();
+    openAccountMenu(provider, 'next');
+    return;
+  }
+  if (event.key === 'ArrowUp') {
+    event.preventDefault();
+    openAccountMenu(provider, 'previous');
+    return;
+  }
+  if (event.key === 'Home') {
+    event.preventDefault();
+    openAccountMenu(provider, 'first');
+    return;
+  }
+  if (event.key === 'End') {
+    event.preventDefault();
+    openAccountMenu(provider, 'last');
+    return;
+  }
+  if (isTypeaheadKey(event)) {
+    event.preventDefault();
+    openAccountMenu(provider, 'selected');
+    applyTypeahead(provider, event.key);
+  }
+}
+
+/**
+ * 開いた listbox 上のキー操作（アカウントメニュー設計書 §6.2）。
+ * @param {string} provider  provider 名
+ * @param {KeyboardEvent} event  キーイベント
+ * @returns {void}
+ */
+function onListboxKeyDown(provider, event) {
+  const menu = accountMenus[provider];
+  if (!menu || !menu.listbox) {
+    return;
+  }
+  if (event.key === 'Escape' || event.key === 'F4' || (event.altKey && event.key === 'ArrowUp')) {
+    event.preventDefault();
+    closeAccountMenu(provider, { focusTrigger: true });
+    return;
+  }
+  if (event.key === 'Tab') {
+    // 既定の Tab 移動はトリガーを起点に続けさせる。
+    closeAccountMenu(provider, { focusTrigger: true });
+    return;
+  }
+  const action = moveActionForKey(event);
+  if (action) {
+    event.preventDefault();
+    setActiveIndex(provider, moveActiveIndex(menu.activeIndex, action, menu.rows.length, visibleOptionCount(menu)));
+    return;
+  }
+  if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault();
+    commitAccountMenu(provider, menu.activeIndex);
+    return;
+  }
+  if (isTypeaheadKey(event)) {
+    event.preventDefault();
+    applyTypeahead(provider, event.key);
+  }
+}
+
+/**
+ * typeahead の 1 文字を処理する（アカウントメニュー設計書 §6.2）。
+ * 匿名 label と現在表示中の識別情報へ先頭一致させる。
+ * @param {string} provider  provider 名
+ * @param {string} character  入力された 1 文字
+ * @returns {void}
+ */
+function applyTypeahead(provider, character) {
+  const menu = accountMenus[provider];
+  if (!menu || !menu.listbox) {
+    return;
+  }
+  const now = Date.now();
+  const elapsed = menu.typeaheadAt === 0 ? Number.POSITIVE_INFINITY : now - menu.typeaheadAt;
+  menu.typeaheadBuffer = updateTypeaheadBuffer(menu.typeaheadBuffer, character, elapsed);
+  menu.typeaheadAt = now;
+  const start = menu.typeaheadBuffer.length > 1 ? menu.activeIndex : menu.activeIndex + 1;
+  const index = findTypeaheadIndex(menu.rows, menu.typeaheadBuffer, start);
+  if (index >= 0) {
+    setActiveIndex(provider, index);
+  }
 }
 
 // ---------------------------------------------------------------- 操作
@@ -634,6 +1363,12 @@ async function main() {
   const observer = new ResizeObserver(() => scheduleDraw());
   for (const panel of panels) observer.observe(panel.canvas.parentElement ?? panel.canvas);
   window.addEventListener('resize', scheduleDraw);
+  // ページを離れるときは実 ID キャッシュを丸ごと捨てる（アカウントメニュー設計書 §3.6）。
+  window.addEventListener('pagehide', () => {
+    if (openMenuProvider !== null) closeAccountMenu(openMenuProvider, { focusTrigger: false });
+    purgeIdentifierCache();
+  });
+  renderAccountControls();
   renderHeader();
   renderFooter();
   scheduleDraw();
@@ -641,7 +1376,8 @@ async function main() {
   try {
     await fetchAccounts();
   } catch {
-    configureAccountSelectors(false);
+    // 一覧を取れないときも匿名トリガーだけは描いておく。
+    renderAccountControls();
   }
   void fetchData();
   setInterval(() => {

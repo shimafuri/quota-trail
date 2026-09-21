@@ -5,8 +5,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const MAX_BYTES = 1024 * 1024;
-const SECRET_KEYS = /^(authorization|cookie|token|access_token|accessToken|refresh_token|refreshToken|apiKey|api_key|headers|credentials|account_id|accountId|account_uuid|accountUuid|email|emailAddress|id_token|sub|profile)$/i;
-const PRIVATE_TEXT = /Bearer\s+[^\s"']+|\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b|\b[^\s@]+@[^\s@]+\.[^\s@]+\b/ig;
+const SECRET_KEYS = /^(authorization|cookie|token|access_token|accessToken|refresh_token|refreshToken|apiKey|api_key|headers|credentials|account_id|accountId|account_uuid|accountUuid|email|emailAddress|id_token|sub|profile|nonce|identifierAccessToken|identifier_access_token)$/i;
+const PRIVATE_TEXT = /Bearer\s+[^\s"']+|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\b[^\s@]+@[^\s@]+\.[^\s@]+\b/ig;
 
 /** @type {{ file: string|null, dir: string|null }} */
 const state = { file: null, dir: null };

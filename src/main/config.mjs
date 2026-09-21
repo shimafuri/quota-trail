@@ -8,7 +8,7 @@ import * as logger from './logger.mjs';
  * @property {number} pollIntervalSec  取得間隔（秒）。既定 180、最小 30
  * @property {number} port             HTTP サーバのポート。既定 47811
  * @property {number|null} retentionDays  保持日数。null = 無制限
- * @property {boolean} revealAccountIdentifiers 実 ID の明示表示を許可するか
+ * @property {boolean} revealAccountIdentifiersInAccountMenu アカウントメニューを開いている間だけ実 ID を表示するか
  */
 
 /** @type {Config} */
@@ -16,8 +16,11 @@ export const DEFAULTS = Object.freeze({
   pollIntervalSec: 180,
   port: 47811,
   retentionDays: null,
-  revealAccountIdentifiers: false,
+  revealAccountIdentifiersInAccountMenu: true,
 });
+
+/** 旧リリースの設定キー。正規化後の設定からは取り除く（設計書 §3.5）。 */
+export const LEGACY_REVEAL_KEY = 'revealAccountIdentifiers';
 
 export const MIN_POLL_INTERVAL_SEC = 30;
 
@@ -26,6 +29,7 @@ let configFile = null;
 
 /**
  * 設定ファイルの場所を決める。無ければ既定値で生成する。
+ * 旧形式の config.json は一回だけ正規化して書き戻す（設計書 §3.5）。
  * @param {string} userDataDir
  * @returns {string} config.json のパス
  */
@@ -36,6 +40,10 @@ export function initConfig(userDataDir) {
   } catch { /* noop */ }
   if (!fs.existsSync(configFile)) {
     writeConfig(DEFAULTS);
+    return configFile;
+  }
+  if (needsRevealSettingMigration(safeRead())) {
+    writeConfig({});
   }
   return configFile;
 }
@@ -66,8 +74,24 @@ export function sanitizeConfig(raw) {
     retentionDays = Number.isFinite(n) && n > 0 ? Math.round(n) : null;
   }
 
-  const revealAccountIdentifiers = src.revealAccountIdentifiers === true;
-  return { pollIntervalSec, port, retentionDays, revealAccountIdentifiers };
+  // 新設定が未定義なら旧 revealAccountIdentifiers の値にかかわらず true とする（設計書 §3.5）。
+  const revealAccountIdentifiersInAccountMenu = src.revealAccountIdentifiersInAccountMenu !== false;
+  return { pollIntervalSec, port, retentionDays, revealAccountIdentifiersInAccountMenu };
+}
+
+/**
+ * 設定ファイルが旧形式のままかどうかを判定する（設計書 §3.5）。
+ * @param {any} raw  config.json をそのまま JSON.parse した値
+ * @returns {boolean} 書き戻しが必要なら true
+ */
+export function needsRevealSettingMigration(raw) {
+  if (!raw || typeof raw !== 'object') {
+    return true;
+  }
+  if (!Object.prototype.hasOwnProperty.call(raw, 'revealAccountIdentifiersInAccountMenu')) {
+    return true;
+  }
+  return Object.prototype.hasOwnProperty.call(raw, LEGACY_REVEAL_KEY);
 }
 
 /**

@@ -2,11 +2,13 @@
 /**
  * renderer 開発用のスタンドアロンサーバ（Electron 不要）。
  *
- *   node scripts/dev-renderer.mjs [--port 47899] [--reveal]
+ *   node scripts/dev-renderer.mjs [--port 47899] [--no-reveal]
  *
  * - `src/renderer/` を `/` に、`src/shared/*.mjs` を `/shared/<file>` に配信
  * - `/api/meta`, `/api/accounts`, `/api/samples`, `/api/latest` を生成データで模擬（設計 §6 の契約に一致）
- * - `--reveal` 指定時は `/api/account-identifier` もダミー識別子で模擬
+ * - `/api/account-identifiers` を process-scoped nonce 付きで模擬（アカウントメニュー設計書 §3）
+ * - 識別情報の表示は既定で有効。`--no-reveal` を付けると匿名縮退を再現する
+ * - fixture には長いメール、UUID だけの account、unknown を含める
  *
  * 生成データ（直近 30 日 / 既定 180 秒間隔）には次を含む:
  * - 5h 系列: 5 時間ごとにリセットして 0 に戻るのこぎり波
@@ -19,6 +21,7 @@
  */
 
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -35,8 +38,14 @@ const DAY = 24 * HOUR;
 const args = process.argv.slice(2);
 const portArgIdx = args.indexOf('--port');
 const PORT = portArgIdx >= 0 ? Number(args[portArgIdx + 1]) : 47899;
-const REVEAL = args.includes('--reveal');
+const REVEAL = !args.includes('--no-reveal');
 const POLL_INTERVAL_SEC = 180;
+
+/** 本番の main process と同じく、起動ごとに作り直す nonce（アカウントメニュー設計書 §3.3）。 */
+const IDENTIFIER_ACCESS_TOKEN = crypto.randomBytes(32).toString('base64url');
+
+/** 実 ID batch endpoint が要求するヘッダ名 */
+const IDENTIFIER_TOKEN_HEADER = 'x-quota-trail-identifier-token';
 
 // ---------------------------------------------------------------- 疑似乱数
 
@@ -215,8 +224,52 @@ for (const k of SERIES_KEYS) DB[k] = [];
 const MAX_ROWS = 50000;
 
 const ACCOUNT_KEYS = {
-  claude: ['claude:1', 'claude:2', 'claude:unknown'],
+  claude: ['claude:1', 'claude:2', 'claude:3', 'claude:unknown'],
   codex: ['codex:1', 'codex:2', 'codex:unknown'],
+};
+
+/**
+ * 匿名 DTO の fixture（`/api/accounts` が返す形）。
+ * 実 ID は一切含めない。
+ * @type {Record<string, {resolution:string, currentAccountKey:string, accounts:{accountKey:string,label:string,isCurrent:boolean,kind:string}[]}>}
+ */
+const ACCOUNT_GROUPS = {
+  claude: {
+    resolution: 'known',
+    currentAccountKey: 'claude:1',
+    accounts: [
+      { accountKey: 'claude:1', label: 'アカウント1', isCurrent: true, kind: 'known' },
+      { accountKey: 'claude:2', label: 'アカウント2', isCurrent: false, kind: 'known' },
+      { accountKey: 'claude:3', label: 'アカウント3', isCurrent: false, kind: 'known' },
+      { accountKey: 'claude:unknown', label: '不明なアカウント', isCurrent: false, kind: 'unknown' },
+    ],
+  },
+  codex: {
+    resolution: 'known',
+    currentAccountKey: 'codex:1',
+    accounts: [
+      { accountKey: 'codex:1', label: 'アカウント1', isCurrent: true, kind: 'known' },
+      { accountKey: 'codex:2', label: 'アカウント2', isCurrent: false, kind: 'known' },
+      { accountKey: 'codex:unknown', label: '不明なアカウント', isCurrent: false, kind: 'unknown' },
+    ],
+  },
+};
+
+/**
+ * 実 ID の fixture（`/api/account-identifiers` が返す形）。
+ * 長いメール、UUID だけの account を混ぜ、unknown は含めない。
+ * @type {Record<string, Record<string, {kind:string, value:string}>>}
+ */
+const ACCOUNT_IDENTIFIERS = {
+  claude: {
+    'claude:1': { kind: 'email', value: 'very.long.developer.account.name.for.layout@example-organization-domain.test' },
+    'claude:2': { kind: 'uuid', value: '01234567-89ab-cdef-0123-456789abcdef' },
+    'claude:3': { kind: 'email', value: 'demo3@example.test' },
+  },
+  codex: {
+    'codex:1': { kind: 'email', value: 'demo-codex@example.test' },
+    'codex:2': { kind: 'uuid', value: 'fedcba98-7654-3210-fedc-ba9876543210' },
+  },
 };
 
 /**
@@ -238,7 +291,7 @@ function accountSelector(provider, key) {
  */
 function rowsForAccount(rows, accountKey) {
   const unknown = accountKey.endsWith(':unknown');
-  const second = accountKey.endsWith(':2');
+  const second = accountKey.endsWith(':2') || accountKey.endsWith(':3');
   const out = [];
   for (let i = 0; i < rows.length; i++) {
     if (unknown && i % 4 !== 0 && i !== rows.length - 1) continue;
@@ -351,52 +404,37 @@ const server = http.createServer((req, res) => {
       dbPath: 'C:\\Users\\dev\\AppData\\Roaming\\quota-trail\\quota-trail.sqlite (dev fake)',
       autostart: false,
       accountDimensionAvailable: true,
-      canRevealAccountIdentifiers: REVEAL,
+      canRevealAccountIdentifiersInAccountMenu: REVEAL,
     });
     return;
   }
 
   if (pathname === '/api/accounts') {
-    sendJson(res, 200, {
-      providers: {
-        claude: {
-          resolution: 'known',
-          currentAccountKey: 'claude:1',
-          accounts: [
-            { accountKey: 'claude:1', label: 'アカウント1', isCurrent: true, kind: 'known' },
-            { accountKey: 'claude:2', label: 'アカウント2', isCurrent: false, kind: 'known' },
-            { accountKey: 'claude:unknown', label: '不明なアカウント', isCurrent: false, kind: 'unknown' },
-          ],
-        },
-        codex: {
-          resolution: 'known',
-          currentAccountKey: 'codex:1',
-          accounts: [
-            { accountKey: 'codex:1', label: 'アカウント1', isCurrent: true, kind: 'known' },
-            { accountKey: 'codex:2', label: 'アカウント2', isCurrent: false, kind: 'known' },
-            { accountKey: 'codex:unknown', label: '不明なアカウント', isCurrent: false, kind: 'unknown' },
-          ],
-        },
-      },
-      now: Date.now(),
-    });
+    /** @type {Record<string, any>} */
+    const payload = { providers: ACCOUNT_GROUPS, now: Date.now() };
+    // nonce は設定が有効なときだけ同一 origin の renderer へ渡す。
+    if (REVEAL) {
+      payload.identifierAccessToken = IDENTIFIER_ACCESS_TOKEN;
+    }
+    sendJson(res, 200, payload);
     return;
   }
 
-  if (pathname === '/api/account-identifier') {
-    const provider = url.searchParams.get('provider');
-    const account = url.searchParams.get('account');
-    if (!REVEAL || !['claude', 'codex'].includes(provider) || !accountSelector(provider, account)) {
+  if (pathname === '/api/account-identifiers') {
+    // 条件不成立の理由は区別せず、常に同じ 404 を返す。
+    const token = req.headers[IDENTIFIER_TOKEN_HEADER];
+    if (!REVEAL || req.method !== 'GET' || token !== IDENTIFIER_ACCESS_TOKEN) {
       sendJson(res, 404, { error: 'not found' });
       return;
     }
-    const suffix = account.endsWith(':2') ? '2' : account.endsWith(':unknown') ? 'unknown' : '1';
-    sendJson(res, 200, {
-      account: {
-        uuid: `00000000-0000-4000-8000-00000000000${suffix === 'unknown' ? '3' : suffix}`,
-        email: `demo${suffix}@example.test`,
-      },
+    const body = Buffer.from(JSON.stringify({ providers: ACCOUNT_IDENTIFIERS, now: Date.now() }));
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Length': body.length,
+      'Cache-Control': 'no-store',
+      'Referrer-Policy': 'no-referrer',
     });
+    res.end(body);
     return;
   }
 
@@ -448,6 +486,11 @@ const server = http.createServer((req, res) => {
       series[key] = rows.length ? rows[rows.length - 1] : null;
     }
     sendJson(res, 200, { series, now: Date.now() });
+    return;
+  }
+
+  if (pathname.startsWith('/api/')) {
+    sendJson(res, 404, { error: 'not found' });
     return;
   }
 

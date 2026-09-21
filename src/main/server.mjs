@@ -1,8 +1,10 @@
-// localhost HTTP サーバ（設計書 §6）
+// localhost HTTP サーバ（設計書 §6 / アカウントメニュー設計書 §3）
 // - 127.0.0.1 のみ bind、読み取り専用、CORS ヘッダは付けない
 // - 静的: src/renderer/* と src/shared/*（/shared/ 配下）
-// - API: /api/meta, /api/samples?from=&to=, /api/latest
+// - API: /api/meta, /api/samples?from=&to=, /api/latest, /api/accounts
+// - 実 ID は /api/account-identifiers だけが返し、process-scoped nonce と設定 gate を要求する
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -11,6 +13,33 @@ import * as logger from './logger.mjs';
 
 const HOST = '127.0.0.1';
 const MAX_POINTS_PER_SERIES = 50_000;
+
+/** 実 ID batch endpoint が要求するヘッダ名（アカウントメニュー設計書 §3.2）。 */
+const IDENTIFIER_TOKEN_HEADER = 'x-quota-trail-identifier-token';
+
+/**
+ * main process 起動時に一度だけ作る nonce（アカウントメニュー設計書 §3.3）。
+ * 実 ID ではないため匿名 DTO の性質を壊さない。
+ * URL、localStorage、ログへは入れない。
+ */
+const IDENTIFIER_ACCESS_TOKEN = crypto.randomBytes(32).toString('base64url');
+
+/**
+ * 長さの違いを漏らさずに nonce を比較する。
+ * @param {unknown} candidate  リクエストヘッダの値
+ * @returns {boolean} 一致すれば true
+ */
+function matchesIdentifierToken(candidate) {
+  if (typeof candidate !== 'string') {
+    return false;
+  }
+  const given = Buffer.from(candidate, 'utf8');
+  const expected = Buffer.from(IDENTIFIER_ACCESS_TOKEN, 'utf8');
+  if (given.length !== expected.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(given, expected);
+}
 
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -71,6 +100,25 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
+/**
+ * 実 ID を含む応答を送る（アカウントメニュー設計書 §3.2）。
+ * 保存も referrer 送出もさせない。
+ * @param {http.ServerResponse} res
+ * @param {number} status
+ * @param {any} obj
+ * @returns {void}
+ */
+function sendPrivateJson(res, status, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+    'Referrer-Policy': 'no-referrer',
+  });
+  res.end(body);
+}
+
 function sendText(res, status, text) {
   res.writeHead(status, {
     'Content-Type': 'text/plain; charset=utf-8',
@@ -82,7 +130,7 @@ function sendText(res, status, text) {
 /**
  * @param {Object} deps
  * @param {any} deps.db
- * @param {() => {pollIntervalSec:number, port:number, revealAccountIdentifiers?:boolean}} deps.readConfig
+ * @param {() => {pollIntervalSec:number, port:number, revealAccountIdentifiersInAccountMenu?:boolean}} deps.readConfig
  * @param {any} [deps.accountManager]
  * @param {string} deps.appRoot   リポジトリ／アプリのルート
  * @param {(port:number) => void} [deps.onPort]  実際に bind したポートの通知
@@ -122,7 +170,7 @@ export async function startServer({ db, readConfig, appRoot, onPort, getAutostar
         backend: db.backend,
         autostart,
         accountDimensionAvailable: db.accountDimensionAvailable !== false,
-        canRevealAccountIdentifiers: cfg.revealAccountIdentifiers === true,
+        canRevealAccountIdentifiersInAccountMenu: cfg.revealAccountIdentifiersInAccountMenu !== false,
       });
       return;
     }
@@ -132,6 +180,7 @@ export async function startServer({ db, readConfig, appRoot, onPort, getAutostar
         sendJson(res, 200, { available: false, now: Date.now() });
         return;
       }
+      const revealEnabled = readConfig().revealAccountIdentifiersInAccountMenu !== false;
       const accounts = accountManager?.accounts?.() ?? (db.listAccounts?.() ?? []);
       /** @type {Record<string, any>} */
       const providers = {};
@@ -164,7 +213,35 @@ export async function startServer({ db, readConfig, appRoot, onPort, getAutostar
         providers[provider] = { resolution, currentAccountKey, accounts: rows };
       }
       // 行には DB と account manager が作る匿名 DTO だけを含める。
-      sendJson(res, 200, { providers, now: Date.now() });
+      // nonce は実 ID ではないため、設定が有効なときだけ top-level へ添える。
+      const payload = { providers, now: Date.now() };
+      if (revealEnabled) {
+        payload.identifierAccessToken = IDENTIFIER_ACCESS_TOKEN;
+      }
+      sendJson(res, 200, payload);
+      return;
+    }
+
+    if (pathname === '/api/account-identifiers') {
+      // 条件不成立の理由は区別せず、常に同じ 404 を返す（アカウントメニュー設計書 §3.3）。
+      const cfg = readConfig();
+      const allowed = req.method === 'GET'
+        && cfg.revealAccountIdentifiersInAccountMenu !== false
+        && db.accountDimensionAvailable !== false
+        && matchesIdentifierToken(req.headers[IDENTIFIER_TOKEN_HEADER]);
+      if (!allowed) {
+        sendJson(res, 404, { error: 'not found' });
+        return;
+      }
+      /** @type {Record<string, Record<string, {kind:string, value:string}>>} */
+      const providers = {};
+      for (const row of db.listAccountIdentifiers?.() ?? []) {
+        if (!providers[row.provider]) {
+          providers[row.provider] = {};
+        }
+        providers[row.provider][row.accountKey] = { kind: row.kind, value: row.value };
+      }
+      sendPrivateJson(res, 200, { providers, now: Date.now() });
       return;
     }
 
@@ -182,19 +259,6 @@ export async function startServer({ db, readConfig, appRoot, onPort, getAutostar
       }
       return out;
     };
-
-    if (pathname === '/api/account-identifier') {
-      const cfg = readConfig();
-      const provider = url.searchParams.get('provider');
-      const key = url.searchParams.get('account');
-      if (cfg.revealAccountIdentifiers !== true || !['claude', 'codex'].includes(provider) || !key) { sendJson(res, 404, { error: 'not found' }); return; }
-      const id = db.resolveAccountKey?.(provider, key);
-      if (id === 'invalid' || id === null) { sendJson(res, 400, { error: 'invalid account selector' }); return; }
-      const account = db.accountIdentifier?.(provider, id);
-      if (!account) { sendJson(res, 404, { error: 'not found' }); return; }
-      sendJson(res, 200, { account });
-      return;
-    }
 
     if (pathname === '/api/latest') {
       const accountIdsByProvider = selectors();

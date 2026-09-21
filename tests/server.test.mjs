@@ -6,6 +6,11 @@ import { decimate, resolveStatic, startServer } from '../src/main/server.mjs';
 
 const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+const FIXTURE_EMAIL = 'private@example.com';
+const FIXTURE_UUID = '11111111-1111-4111-8111-111111111111';
+const FIXTURE_CODEX_UUID = '22222222-2222-4222-8222-222222222222';
+const IDENTIFIER_HEADER = 'X-Quota-Trail-Identifier-Token';
+
 test('decimate は上限以下ならそのまま、超えたら先頭と末尾を残して間引く', () => {
   const arr = Array.from({ length: 10 }, (_, i) => i);
   assert.equal(decimate(arr, 10), arr);
@@ -25,7 +30,7 @@ test('resolveStatic はルート外を拒否する', () => {
 });
 
 /** テスト用のダミー DB */
-function fakeDb() {
+function fakeDb(over = {}) {
   const s = {
     observedAt: 1_757_200_000_000,
     provider: 'claude',
@@ -45,7 +50,12 @@ function fakeDb() {
     listAccounts: () => [{ provider:'claude', accountKey:'claude:1', label:'アカウント1' }],
     hasUnknownSamples: (provider) => provider === 'codex',
     resolveAccountKey: (p, k) => k === `${p}:unknown` ? null : (k === `${p}:1` ? 42 : 'invalid'),
-    accountIdentifier: () => ({ uuid:'11111111-1111-4111-8111-111111111111', email:'private@example.com' }),
+    listAccountIdentifiers: () => ([
+      { provider:'claude', accountKey:'claude:1', kind:'email', value: FIXTURE_EMAIL },
+      { provider:'claude', accountKey:'claude:2', kind:'uuid', value: FIXTURE_UUID },
+      { provider:'codex', accountKey:'codex:1', kind:'uuid', value: FIXTURE_CODEX_UUID },
+    ]),
+    ...over,
   };
 }
 
@@ -58,16 +68,34 @@ function fakeAccountManager() {
   };
 }
 
-test('HTTP API: /api/meta, /api/latest, /api/samples', async (t) => {
+// 閉じた直後の port を別サーバが再利用すると keep-alive 接続が使い回されて fetch が失敗するため、
+// テスト内では希望 port をずらして毎回別の port へ bind する。
+let nextPreferredPort = 47850;
+
+/**
+ * テスト用のサーバを起動し、base URL を返す。
+ * @param {import('node:test').TestContext} t
+ * @param {Object} [options]
+ * @param {any} [options.db]
+ * @param {boolean} [options.reveal]
+ * @returns {Promise<string>}
+ */
+async function withServer(t, { db = fakeDb(), reveal = true } = {}) {
+  const preferred = nextPreferredPort;
+  nextPreferredPort += 1;
   const server = await startServer({
-    db: fakeDb(),
-    readConfig: () => ({ pollIntervalSec: 180, port: 0 }),
+    db,
+    readConfig: () => ({ pollIntervalSec: 180, port: preferred, revealAccountIdentifiersInAccountMenu: reveal }),
     appRoot,
     getAutostart: () => true,
     accountManager: fakeAccountManager(),
   });
   t.after(() => server.close());
-  const base = server.url.replace(/\/$/, '');
+  return server.url.replace(/\/$/, '');
+}
+
+test('HTTP API: /api/meta, /api/latest, /api/samples', async (t) => {
+  const base = await withServer(t);
 
   const meta = await (await fetch(`${base}/api/meta`)).json();
   assert.deepEqual(meta.providers, ['claude', 'codex']);
@@ -77,6 +105,8 @@ test('HTTP API: /api/meta, /api/latest, /api/samples', async (t) => {
   assert.equal(meta.dbPath, 'C:/tmp/fake.sqlite');
   assert.equal(meta.autostart, true);
   assert.equal(meta.accountDimensionAvailable, true);
+  assert.equal(meta.canRevealAccountIdentifiersInAccountMenu, true);
+  assert.equal(Object.prototype.hasOwnProperty.call(meta, 'canRevealAccountIdentifiers'), false);
 
   const accounts = await (await fetch(`${base}/api/accounts`)).json();
   assert.equal(accounts.providers.claude.resolution, 'known');
@@ -85,7 +115,7 @@ test('HTTP API: /api/meta, /api/latest, /api/samples', async (t) => {
     accountKey: 'claude:1', label: 'アカウント1', isCurrent: true, kind: 'known',
   }]);
   assert.equal(accounts.providers.codex.accounts[0].accountKey, 'codex:unknown');
-  const serializedAccounts = JSON.stringify(accounts);
+  const serializedAccounts = JSON.stringify(accounts.providers);
   assert.equal(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(serializedAccounts), false);
   assert.equal(/[^\s"]+@[^\s"]+/.test(serializedAccounts), false);
   assert.equal(/"(?:id|accountId)"\s*:/.test(serializedAccounts), false);
@@ -110,4 +140,117 @@ test('HTTP API: /api/meta, /api/latest, /api/samples', async (t) => {
 
   const post = await fetch(`${base}/api/meta`, { method: 'POST' });
   assert.equal(post.status, 405);
+});
+
+test('/api/accounts は設定有効時だけ identifierAccessToken を返す', async (t) => {
+  const enabled = await withServer(t);
+  const withToken = await (await fetch(`${enabled}/api/accounts`)).json();
+  assert.equal(typeof withToken.identifierAccessToken, 'string');
+  assert.ok(withToken.identifierAccessToken.length >= 32);
+
+  const disabled = await withServer(t, { reveal: false });
+  const withoutToken = await (await fetch(`${disabled}/api/accounts`)).json();
+  assert.equal(Object.prototype.hasOwnProperty.call(withoutToken, 'identifierAccessToken'), false);
+});
+
+test('/api/account-identifiers は nonce と設定が揃った GET だけ 200 になる', async (t) => {
+  const base = await withServer(t);
+  const { identifierAccessToken } = await (await fetch(`${base}/api/accounts`)).json();
+
+  const ok = await fetch(`${base}/api/account-identifiers`, { headers: { [IDENTIFIER_HEADER]: identifierAccessToken } });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers.get('cache-control'), 'no-store');
+  assert.equal(ok.headers.get('referrer-policy'), 'no-referrer');
+  const body = await ok.json();
+  assert.deepEqual(body.providers, {
+    claude: {
+      'claude:1': { kind: 'email', value: FIXTURE_EMAIL },
+      'claude:2': { kind: 'uuid', value: FIXTURE_UUID },
+    },
+    codex: {
+      'codex:1': { kind: 'uuid', value: FIXTURE_CODEX_UUID },
+    },
+  });
+  assert.equal(typeof body.now, 'number');
+  // 内部整数 ID、identity_source、unknown、余分な profile field を含めない。
+  const serialized = JSON.stringify(body);
+  assert.equal(serialized.includes('identity_source'), false);
+  assert.equal(serialized.includes('identitySource'), false);
+  assert.equal(serialized.includes('unknown'), false);
+  assert.equal(/"(?:id|accountId|alias_no|aliasNo|assurance)"\s*:/.test(serialized), false);
+  assert.deepEqual(Object.keys(body).sort(), ['now', 'providers']);
+  for (const rows of Object.values(body.providers)) {
+    for (const entry of Object.values(rows)) {
+      assert.deepEqual(Object.keys(entry).sort(), ['kind', 'value']);
+    }
+  }
+
+  const missing = await fetch(`${base}/api/account-identifiers`);
+  assert.equal(missing.status, 404);
+  assert.deepEqual(await missing.json(), { error: 'not found' });
+
+  const mismatched = await fetch(`${base}/api/account-identifiers`, { headers: { [IDENTIFIER_HEADER]: 'wrong-token' } });
+  assert.equal(mismatched.status, 404);
+  assert.deepEqual(await mismatched.json(), { error: 'not found' });
+
+  const sameLength = await fetch(`${base}/api/account-identifiers`, { headers: { [IDENTIFIER_HEADER]: 'x'.repeat(identifierAccessToken.length) } });
+  assert.equal(sameLength.status, 404);
+
+  const head = await fetch(`${base}/api/account-identifiers`, { method: 'HEAD', headers: { [IDENTIFIER_HEADER]: identifierAccessToken } });
+  assert.equal(head.status, 404);
+});
+
+test('/api/account-identifiers は設定無効と縮退で同じ 404 になる', async (t) => {
+  const enabled = await withServer(t);
+  const { identifierAccessToken } = await (await fetch(`${enabled}/api/accounts`)).json();
+
+  const disabled = await withServer(t, { reveal: false });
+  const offByConfig = await fetch(`${disabled}/api/account-identifiers`, { headers: { [IDENTIFIER_HEADER]: identifierAccessToken } });
+  assert.equal(offByConfig.status, 404);
+  assert.deepEqual(await offByConfig.json(), { error: 'not found' });
+
+  const degraded = await withServer(t, {
+    db: fakeDb({ accountDimensionAvailable: false, listAccountIdentifiers: () => [] }),
+  });
+  const offByDimension = await fetch(`${degraded}/api/account-identifiers`, { headers: { [IDENTIFIER_HEADER]: identifierAccessToken } });
+  assert.equal(offByDimension.status, 404);
+  assert.deepEqual(await offByDimension.json(), { error: 'not found' });
+});
+
+test('エラー応答は request header・query・fixture の実 ID を反射しない', async (t) => {
+  const base = await withServer(t);
+  const { identifierAccessToken } = await (await fetch(`${base}/api/accounts`)).json();
+  const probe = `${base}/api/account-identifiers?account=${encodeURIComponent(FIXTURE_EMAIL)}&uuid=${FIXTURE_UUID}`;
+  const response = await fetch(probe, { headers: { [IDENTIFIER_HEADER]: 'reflect-me-please' } });
+  assert.equal(response.status, 404);
+  const text = await response.text();
+  assert.equal(text, '{"error":"not found"}');
+  assert.equal(text.includes(FIXTURE_EMAIL), false);
+  assert.equal(text.includes(FIXTURE_UUID), false);
+  assert.equal(text.includes('reflect-me-please'), false);
+  assert.equal(text.includes(identifierAccessToken), false);
+});
+
+test('旧単件 endpoint /api/account-identifier は 404 になる', async (t) => {
+  const base = await withServer(t);
+  const { identifierAccessToken } = await (await fetch(`${base}/api/accounts`)).json();
+  for (const url of [
+    `${base}/api/account-identifier?provider=claude&account=claude:1`,
+    `${base}/api/account-identifier`,
+  ]) {
+    const response = await fetch(url, { headers: { [IDENTIFIER_HEADER]: identifierAccessToken } });
+    assert.equal(response.status, 404);
+    assert.deepEqual(await response.json(), { error: 'not found' });
+  }
+});
+
+test('実 ID endpoint を追加しても series shape は変わらない', async (t) => {
+  const base = await withServer(t);
+  const samples = await (await fetch(`${base}/api/samples?from=0&to=${Date.now()}&claude=claude:1`)).json();
+  assert.deepEqual(Object.keys(samples.series), ['claude/5h', 'claude/weekly', 'codex/5h', 'codex/weekly']);
+  const latest = await (await fetch(`${base}/api/latest?claude=claude:1`)).json();
+  assert.deepEqual(Object.keys(latest.series), ['claude/5h', 'claude/weekly', 'codex/5h', 'codex/weekly']);
+  const serialized = `${JSON.stringify(samples)}${JSON.stringify(latest)}`;
+  assert.equal(serialized.includes(FIXTURE_EMAIL), false);
+  assert.equal(serialized.includes(FIXTURE_UUID), false);
 });
