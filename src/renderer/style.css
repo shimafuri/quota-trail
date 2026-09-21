@@ -103,19 +103,68 @@ body {
   font-weight: normal;
 }
 
-/* ---------- グリッド ---------- */
+/* ---------- provider group ---------- */
 
-.grid {
+.provider-groups {
   display: grid;
-  /* 設計 §7.1: repeat(auto-fit, minmax(300px, 1fr)) を基本にしつつ、
-     - 下限に 50% を混ぜて 3 列以上にならないようにする（2x2 を維持）
-     - min(...) で幅 320px でも横スクロールしないようにする */
-  grid-template-columns: repeat(
-    auto-fit,
-    minmax(min(max(300px, calc(50% - 5px)), 100%), 1fr)
-  );
-  gap: 10px;
+  gap: 18px;
   padding: 6px 12px 12px;
+}
+
+.provider-group {
+  min-width: 0;
+}
+
+.provider-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  margin: 0 0 6px;
+}
+
+.provider-header h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.account-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 7px;
+  min-width: 0;
+}
+
+.account-control label,
+.current-account-note {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.account-control select,
+.reveal-button {
+  min-width: 0;
+  max-width: 100%;
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  background: var(--panel-bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 5px;
+}
+
+.reveal-button {
+  cursor: pointer;
+}
+
+.provider-chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
   align-items: start;
 }
 
@@ -208,6 +257,45 @@ body {
   .panel-ctrls {
     margin-left: 0;
   }
+}
+
+@media (max-width: 600px) {
+  .provider-header {
+    align-items: flex-start;
+  }
+  .account-control {
+    width: 100%;
+  }
+  .provider-chart-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---------- 実 ID 確認 ---------- */
+
+.identifier-dialog {
+  max-width: min(520px, calc(100vw - 32px));
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 18px;
+}
+
+.identifier-dialog::backdrop {
+  background: rgb(0 0 0 / 35%);
+}
+
+.identifier-dialog h2 {
+  margin: 0 0 10px;
+  font-size: 15px;
+}
+
+.identifier-values {
+  overflow-wrap: anywhere;
+}
+
+.identifier-values p {
+  margin: 6px 0;
 }
 
 /* ---------- フッタ ---------- */

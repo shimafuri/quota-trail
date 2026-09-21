@@ -2,10 +2,11 @@
 /**
  * renderer 開発用のスタンドアロンサーバ（Electron 不要）。
  *
- *   node scripts/dev-renderer.mjs [--port 47899]
+ *   node scripts/dev-renderer.mjs [--port 47899] [--reveal]
  *
  * - `src/renderer/` を `/` に、`src/shared/*.mjs` を `/shared/<file>` に配信
- * - `/api/meta`, `/api/samples`, `/api/latest` を生成データで模擬（設計 §6 の契約に一致）
+ * - `/api/meta`, `/api/accounts`, `/api/samples`, `/api/latest` を生成データで模擬（設計 §6 の契約に一致）
+ * - `--reveal` 指定時は `/api/account-identifier` もダミー識別子で模擬
  *
  * 生成データ（直近 30 日 / 既定 180 秒間隔）には次を含む:
  * - 5h 系列: 5 時間ごとにリセットして 0 に戻るのこぎり波
@@ -34,6 +35,7 @@ const DAY = 24 * HOUR;
 const args = process.argv.slice(2);
 const portArgIdx = args.indexOf('--port');
 const PORT = portArgIdx >= 0 ? Number(args[portArgIdx + 1]) : 47899;
+const REVEAL = args.includes('--reveal');
 const POLL_INTERVAL_SEC = 180;
 
 // ---------------------------------------------------------------- 疑似乱数
@@ -212,6 +214,49 @@ for (const k of SERIES_KEYS) DB[k] = [];
 
 const MAX_ROWS = 50000;
 
+const ACCOUNT_KEYS = {
+  claude: ['claude:1', 'claude:2', 'claude:unknown'],
+  codex: ['codex:1', 'codex:2', 'codex:unknown'],
+};
+
+/**
+ * @param {string} provider
+ * @param {string|null} key
+ * @returns {string|null}
+ */
+function accountSelector(provider, key) {
+  const current = `${provider}:1`;
+  if (key === null) return current;
+  return ACCOUNT_KEYS[provider]?.includes(key) ? key : null;
+}
+
+/**
+ * account ごとに見た目が変わるよう、基準データへ表示用の差分を適用する。
+ * @param {any[]} rows
+ * @param {string} accountKey
+ * @returns {any[]}
+ */
+function rowsForAccount(rows, accountKey) {
+  const unknown = accountKey.endsWith(':unknown');
+  const second = accountKey.endsWith(':2');
+  const out = [];
+  for (let i = 0; i < rows.length; i++) {
+    if (unknown && i % 4 !== 0 && i !== rows.length - 1) continue;
+    const row = rows[i];
+    if (row.usedPercent === null || (!second && !unknown)) {
+      out.push(row);
+      continue;
+    }
+    const phase = Math.sin((row.observedAt / HOUR) * 0.7) * (second ? 8 : 4);
+    const scale = second ? 0.62 : 0.78;
+    out.push({
+      ...row,
+      usedPercent: Math.round(Math.max(0, Math.min(100, row.usedPercent * scale + (second ? 18 : 8) + phase)) * 10) / 10,
+    });
+  }
+  return out;
+}
+
 /**
  * 範囲外の直前 1 点・直後 1 点を含めて返す。
  * @param {any[]} rows
@@ -305,6 +350,52 @@ const server = http.createServer((req, res) => {
       now: Date.now(),
       dbPath: 'C:\\Users\\dev\\AppData\\Roaming\\quota-trail\\quota-trail.sqlite (dev fake)',
       autostart: false,
+      accountDimensionAvailable: true,
+      canRevealAccountIdentifiers: REVEAL,
+    });
+    return;
+  }
+
+  if (pathname === '/api/accounts') {
+    sendJson(res, 200, {
+      providers: {
+        claude: {
+          resolution: 'known',
+          currentAccountKey: 'claude:1',
+          accounts: [
+            { accountKey: 'claude:1', label: 'アカウント1', isCurrent: true, kind: 'known' },
+            { accountKey: 'claude:2', label: 'アカウント2', isCurrent: false, kind: 'known' },
+            { accountKey: 'claude:unknown', label: '不明なアカウント', isCurrent: false, kind: 'unknown' },
+          ],
+        },
+        codex: {
+          resolution: 'known',
+          currentAccountKey: 'codex:1',
+          accounts: [
+            { accountKey: 'codex:1', label: 'アカウント1', isCurrent: true, kind: 'known' },
+            { accountKey: 'codex:2', label: 'アカウント2', isCurrent: false, kind: 'known' },
+            { accountKey: 'codex:unknown', label: '不明なアカウント', isCurrent: false, kind: 'unknown' },
+          ],
+        },
+      },
+      now: Date.now(),
+    });
+    return;
+  }
+
+  if (pathname === '/api/account-identifier') {
+    const provider = url.searchParams.get('provider');
+    const account = url.searchParams.get('account');
+    if (!REVEAL || !['claude', 'codex'].includes(provider) || !accountSelector(provider, account)) {
+      sendJson(res, 404, { error: 'not found' });
+      return;
+    }
+    const suffix = account.endsWith(':2') ? '2' : account.endsWith(':unknown') ? 'unknown' : '1';
+    sendJson(res, 200, {
+      account: {
+        uuid: `00000000-0000-4000-8000-00000000000${suffix === 'unknown' ? '3' : suffix}`,
+        email: `demo${suffix}@example.test`,
+      },
     });
     return;
   }
@@ -316,11 +407,22 @@ const server = http.createServer((req, res) => {
       sendJson(res, 400, { error: 'from/to required' });
       return;
     }
+    const accountKeys = {};
+    for (const provider of ['claude', 'codex']) {
+      const key = accountSelector(provider, url.searchParams.get(provider));
+      if (key === null) {
+        sendJson(res, 400, { error: 'invalid account selector' });
+        return;
+      }
+      accountKeys[provider] = key;
+    }
     /** @type {Record<string, any[]>} */
     const series = {};
     let decimated = false;
     for (const key of SERIES_KEYS) {
-      const d = decimate(sliceWithNeighbors(DB[key], from, to));
+      const [provider] = key.split('/');
+      const rows = rowsForAccount(sliceWithNeighbors(DB[key], from, to), accountKeys[provider]);
+      const d = decimate(rows);
       series[key] = d.rows;
       decimated = decimated || d.decimated;
     }
@@ -329,10 +431,20 @@ const server = http.createServer((req, res) => {
   }
 
   if (pathname === '/api/latest') {
+    const accountKeys = {};
+    for (const provider of ['claude', 'codex']) {
+      const key = accountSelector(provider, url.searchParams.get(provider));
+      if (key === null) {
+        sendJson(res, 400, { error: 'invalid account selector' });
+        return;
+      }
+      accountKeys[provider] = key;
+    }
     /** @type {Record<string, any>} */
     const series = {};
     for (const key of SERIES_KEYS) {
-      const rows = DB[key];
+      const [provider] = key.split('/');
+      const rows = rowsForAccount(DB[key], accountKeys[provider]);
       series[key] = rows.length ? rows[rows.length - 1] : null;
     }
     sendJson(res, 200, { series, now: Date.now() });

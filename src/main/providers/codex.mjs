@@ -7,6 +7,8 @@ import path from 'node:path';
 import { runCommand } from '../lib/exec.mjs';
 import { normalizeCodex, normalizeCodexAppServer, errorSamples, httpErrorCode, allFailed } from '../lib/normalize.mjs';
 import { readRateLimitsViaAppServer } from './codex-app-server.mjs';
+import { codexIdentityFromAuth } from '../lib/account-identity.mjs';
+import { warn } from '../logger.mjs';
 
 const USAGE_URL = 'https://chatgpt.com/backend-api/codex/usage';
 const TIMEOUT_MS = 15_000;
@@ -40,7 +42,7 @@ export function readAuth() {
     const token = json?.tokens?.access_token;
     const accountId = json?.tokens?.account_id ?? null;
     if (typeof token !== 'string' || token === '') return { token: null, accountId: null, errorCode: 'no_credentials' };
-    return { token, accountId: typeof accountId === 'string' ? accountId : null, errorCode: null };
+    return { token, accountId: typeof accountId === 'string' ? accountId : null, auth: json, errorCode: null };
   } catch {
     return { token: null, accountId: null, errorCode: 'parse' };
   }
@@ -60,19 +62,30 @@ export function userAgent() {
 }
 
 /**
- * Codex の使用率を取得して Sample[]（5h / weekly の 2 行）を返す。例外は投げない。
+ * Codex の使用率と帰属 identity を ProviderBatch として返す。例外は投げない。
  * @param {{observedAt:number, intervalSec:number, allowAppServer?:boolean}} ctx
- * @returns {Promise<import('../lib/normalize.mjs').Sample[]>}
+ * @returns {Promise<{provider:'codex', samples:import('../lib/normalize.mjs').Sample[], identity:any}>}
  */
 export async function fetchCodexSamples({ observedAt, intervalSec, allowAppServer = true }) {
-  const { token, accountId, errorCode } = readAuth();
+  const { token, auth, errorCode } = readAuth();
+  const chosen = codexIdentityFromAuth(auth);
+  const identity = chosen.identity;
+  if (chosen.claimMismatch) {
+    warn('codex_account_claim_mismatch');
+  }
   if (!token) {
     // 資格情報が無い場合も app-server が自前でログイン情報を持っていることがある
     if (allowAppServer) {
       const viaCli = await tryAppServer({ observedAt, intervalSec });
-      if (viaCli) return viaCli;
+      if (viaCli) {
+        return { provider: 'codex', samples: viaCli.samples, identity: viaCli.identity };
+      }
     }
-    return errorSamples('codex', { observedAt, intervalSec, errorCode: errorCode ?? 'no_credentials' });
+    return {
+      provider: 'codex',
+      samples: errorSamples('codex', { observedAt, intervalSec, errorCode: errorCode ?? 'no_credentials' }),
+      identity: null,
+    };
   }
 
   const ac = new AbortController();
@@ -88,7 +101,10 @@ export async function fetchCodexSamples({ observedAt, intervalSec, allowAppServe
       'User-Agent': userAgent(),
       Accept: 'application/json',
     };
-    if (accountId) headers['ChatGPT-Account-Id'] = accountId;
+    if (chosen.accountId) {
+      // JWT claim fallback でも、identity と同じ値を usage header に送る。
+      headers['ChatGPT-Account-Id'] = chosen.accountId;
+    }
 
     const res = await fetch(USAGE_URL, { method: 'GET', signal: ac.signal, headers });
     if (!res.ok) {
@@ -112,27 +128,37 @@ export async function fetchCodexSamples({ observedAt, intervalSec, allowAppServe
     clearTimeout(timer);
   }
 
-  if (httpRows && !httpError) return httpRows;
+  if (httpRows && !httpError) {
+    return { provider: 'codex', samples: httpRows, identity };
+  }
 
   // フォールバック条件: 401（auth_expired）または応答形不一致（parse）のとき 1 回だけ
   const shouldFallback = allowAppServer && (httpError === 'auth_expired' || httpError === 'parse');
   if (shouldFallback) {
     const viaCli = await tryAppServer({ observedAt, intervalSec });
-    if (viaCli) return viaCli;
+    if (viaCli) {
+      return { provider: 'codex', samples: viaCli.samples, identity: viaCli.identity };
+    }
   }
   // 応答形不一致でも 5h だけ読めていた等の部分結果があればそれを返す
-  if (httpRows) return httpRows;
-  return errorSamples('codex', { observedAt, intervalSec, errorCode: httpError ?? 'network' });
+  if (httpRows) {
+    return { provider: 'codex', samples: httpRows, identity };
+  }
+  return {
+    provider: 'codex',
+    samples: errorSamples('codex', { observedAt, intervalSec, errorCode: httpError ?? 'network' }),
+    identity,
+  };
 }
 
 /**
  * app-server フォールバック。読めなければ null。
- * @returns {Promise<import('../lib/normalize.mjs').Sample[]|null>}
+ * @returns {Promise<{samples:import('../lib/normalize.mjs').Sample[], identity:any}|null>}
  */
 async function tryAppServer({ observedAt, intervalSec }) {
   const r = await readRateLimitsViaAppServer({});
   if (!r.ok) return null;
   const rows = normalizeCodexAppServer(r.result, { observedAt, intervalSec });
   if (allFailed(rows)) return null;
-  return rows;
+  return { samples: rows, identity: r.identity ?? null };
 }

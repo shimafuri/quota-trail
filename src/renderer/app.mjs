@@ -1,18 +1,21 @@
 /**
- * ダッシュボードの状態管理・データ取得・イベント処理（設計 §7.1〜§7.3）。
+ * ダッシュボードの状態管理・データ取得・イベント処理（設計書 §7）。
  * @module renderer/app
  */
 
 import { computeGaps } from '/shared/gaps.mjs';
 import { formatDateTime, formatClockLabel } from '/shared/ticks.mjs';
+import { chooseAccountSelection } from '/shared/account-selection.mjs';
 import { SERIES, SERIES_KEYS } from './theme.mjs';
 import { drawChart, xToTime, nearestSample } from './chart.mjs';
 
 /** @typedef {import('/shared/gaps.mjs').Sample} Sample */
 /** @typedef {import('./theme.mjs').SeriesKey} SeriesKey */
 
-const STORAGE_KEY = 'quota-trail.ui.v1';
-const MIN_RANGE_MS = 60 * 1000; // 1 分（技術的下限。ゼロ幅レンジの回避のみが目的）
+const STORAGE_KEY = 'quota-trail.ui.v2';
+const LEGACY_STORAGE_KEY = 'quota-trail.ui.v1';
+const PROVIDERS = ['claude', 'codex'];
+const MIN_RANGE_MS = 60 * 1000;
 const GAP_FACTOR = 2.5;
 const FOLLOW_INTERVAL_MS = 60_000;
 const FETCH_DEBOUNCE_MS = 150;
@@ -24,28 +27,12 @@ const PERIODS = /** @type {const} */ ([
   ['custom', 'カスタム', 0],
 ]);
 
-/**
- * @typedef {Object} PanelState
- * @property {'line'|'bar'} mode
- * @property {boolean} points
- */
-
-/**
- * @typedef {Object} Panel
- * @property {SeriesKey} key
- * @property {HTMLElement} root
- * @property {HTMLCanvasElement} canvas
- * @property {HTMLSelectElement} periodSel
- * @property {HTMLSelectElement} modeSel
- * @property {HTMLSelectElement} pointsSel
- * @property {{x:number,y:number,w:number,h:number}|null} rect 最後に描いたプロット矩形
- * @property {{x:number,y:number}|null} hover
- */
+/** @typedef {{mode:'line'|'bar',points:boolean}} PanelState */
+/** @typedef {{key:SeriesKey,root:HTMLElement,canvas:HTMLCanvasElement,periodSel:HTMLSelectElement,modeSel:HTMLSelectElement,pointsSel:HTMLSelectElement,rect:{x:number,y:number,w:number,h:number}|null,hover:{x:number,y:number}|null}} Panel */
 
 const state = {
   /** @type {'24h'|'7d'|'30d'|'custom'} */
   period: '24h',
-  /** @type {{from:number,to:number}} */
   custom: { from: Date.now() - 24 * 60 * 60 * 1000, to: Date.now() },
   /** @type {Record<string, PanelState>} */
   panels: {},
@@ -54,10 +41,15 @@ const state = {
   data: {},
   /** @type {Record<string, Sample|null>} */
   latest: {},
-  /** @type {{pollIntervalSec:number, dbPath:string}|null} */
+  /** @type {Record<string, any>} */
+  accountGroups: {},
+  /** @type {Record<string, string|null>} */
+  selectedAccounts: { claude: null, codex: null },
+  /** @type {Record<string, string>} */
+  savedSelections: {},
+  /** @type {{pollIntervalSec:number,backend:string,accountDimensionAvailable:boolean,canRevealAccountIdentifiers:boolean}|null} */
   meta: null,
   decimated: false,
-  /** @type {string|null} */
   error: null,
 };
 
@@ -69,46 +61,63 @@ for (const key of SERIES_KEYS) {
 
 /** @type {Panel[]} */
 const panels = [];
+/** @type {Record<string, HTMLSelectElement>} */
+const accountSelects = {};
+/** @type {Record<string, HTMLElement>} */
+const currentAccountNotes = {};
+/** @type {Record<string, HTMLButtonElement>} */
+const revealButtons = {};
+/** @type {Record<string, HTMLElement>} */
+const providerGroups = {};
+/** @type {{dialog:HTMLDialogElement|null, controller:AbortController|null, opener:HTMLButtonElement|null}|null} */
+let activeIdentifierDialog = null;
+let revealGeneration = 0;
 
 // ---------------------------------------------------------------- 永続化
 
+/** @param {any} prefs */
+function applyPanelPrefs(prefs) {
+  if (!prefs || typeof prefs !== 'object') return;
+  if (PERIODS.some(([id]) => id === prefs.period)) state.period = prefs.period;
+  if (prefs.custom && Number.isFinite(prefs.custom.from) && Number.isFinite(prefs.custom.to) && prefs.custom.to > prefs.custom.from) {
+    state.custom = { from: prefs.custom.from, to: prefs.custom.to };
+  }
+  if (prefs.panels && typeof prefs.panels === 'object') {
+    for (const key of SERIES_KEYS) {
+      const panel = prefs.panels[key];
+      if (!panel) continue;
+      if (panel.mode === 'line' || panel.mode === 'bar') state.panels[key].mode = panel.mode;
+      if (typeof panel.points === 'boolean') state.panels[key].points = panel.points;
+    }
+  }
+}
+
 function loadPrefs() {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return;
-    const o = JSON.parse(raw);
-    if (o && typeof o === 'object') {
-      if (PERIODS.some(([id]) => id === o.period)) state.period = o.period;
-      if (
-        o.custom &&
-        Number.isFinite(o.custom.from) &&
-        Number.isFinite(o.custom.to) &&
-        o.custom.to > o.custom.from
-      ) {
-        state.custom = { from: o.custom.from, to: o.custom.to };
-      }
-      if (o.panels && typeof o.panels === 'object') {
-        for (const key of SERIES_KEYS) {
-          const p = o.panels[key];
-          if (!p) continue;
-          if (p.mode === 'line' || p.mode === 'bar') state.panels[key].mode = p.mode;
-          if (typeof p.points === 'boolean') state.panels[key].points = p.points;
-        }
+    const current = localStorage.getItem(STORAGE_KEY);
+    const legacy = current ? null : localStorage.getItem(LEGACY_STORAGE_KEY);
+    const prefs = JSON.parse(current ?? legacy ?? 'null');
+    applyPanelPrefs(prefs);
+    if (current && prefs?.selectedAccounts && typeof prefs.selectedAccounts === 'object') {
+      for (const provider of PROVIDERS) {
+        if (typeof prefs.selectedAccounts[provider] === 'string') state.savedSelections[provider] = prefs.selectedAccounts[provider];
       }
     }
   } catch {
-    /* 壊れていれば既定値のまま */
+    /* 壊れた保存値は使わない。 */
   }
 }
 
 function savePrefs() {
   try {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({ period: state.period, custom: state.custom, panels: state.panels }),
-    );
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      period: state.period,
+      custom: state.custom,
+      panels: state.panels,
+      selectedAccounts: state.savedSelections,
+    }));
   } catch {
-    /* プライベートモード等では無視 */
+    /* プライベートモード等では保存できなくても表示を続ける。 */
   }
 }
 
@@ -117,22 +126,17 @@ function savePrefs() {
 /** @returns {{from:number,to:number}} */
 function currentRange() {
   if (state.period === 'custom') return { from: state.custom.from, to: state.custom.to };
-  const def = PERIODS.find(([id]) => id === state.period);
-  const span = def ? def[2] : 24 * 60 * 60 * 1000;
+  const definition = PERIODS.find(([id]) => id === state.period);
+  const span = definition ? definition[2] : 24 * 60 * 60 * 1000;
   return { from: state.now - span, to: state.now };
 }
 
-/**
- * ズーム / パンの結果を「カスタム」として 4 パネルに反映する。
- * @param {number} from
- * @param {number} to
- */
+/** @param {number} from @param {number} to */
 function setCustomRange(from, to) {
   const span = Math.max(MIN_RANGE_MS, to - from);
-  const t = from + span;
-  state.custom = { from: t - span, to: t };
+  state.custom = { from, to: from + span };
   state.period = 'custom';
-  for (const p of panels) p.periodSel.value = 'custom';
+  for (const panel of panels) panel.periodSel.value = 'custom';
   savePrefs();
   scheduleDraw();
   scheduleFetch();
@@ -140,254 +144,400 @@ function setCustomRange(from, to) {
 
 // ---------------------------------------------------------------- 取得
 
-/** @type {number} */
 let fetchTimer = 0;
 let fetchSeq = 0;
+/** @type {AbortController|null} */
+let fetchController = null;
 
 function scheduleFetch() {
   clearTimeout(fetchTimer);
-  fetchTimer = window.setTimeout(fetchSamples, FETCH_DEBOUNCE_MS);
+  fetchTimer = window.setTimeout(() => { void fetchData(); }, FETCH_DEBOUNCE_MS);
 }
 
 async function fetchMeta() {
   try {
-    const res = await fetch('/api/meta', { cache: 'no-store' });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = await res.json();
-    state.meta = { pollIntervalSec: json.pollIntervalSec, dbPath: json.dbPath };
+    const response = await fetch('/api/meta', { cache: 'no-store' });
+    if (!response.ok) throw new Error('meta');
+    const json = await response.json();
+    state.meta = {
+      pollIntervalSec: json.pollIntervalSec,
+      backend: String(json.backend ?? ''),
+      accountDimensionAvailable: json.accountDimensionAvailable !== false,
+      canRevealAccountIdentifiers: json.canRevealAccountIdentifiers === true,
+    };
     if (Number.isFinite(json.now)) state.now = json.now;
-  } catch (e) {
+    if (!state.meta.canRevealAccountIdentifiers) discardIdentifierDialog();
+  } catch {
     state.meta = null;
+    discardIdentifierDialog();
   }
   renderFooter();
 }
 
-async function fetchSamples() {
-  const seq = ++fetchSeq;
-  const { from, to } = currentRange();
-  try {
-    const res = await fetch(
-      `/api/samples?from=${Math.round(from)}&to=${Math.round(to)}`,
-      { cache: 'no-store' },
-    );
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = await res.json();
-    if (seq !== fetchSeq) return; // 古い応答は捨てる
-    for (const key of SERIES_KEYS) {
-      const rows = (json.series && json.series[key]) || [];
-      rows.sort((/** @type {Sample} */ a, /** @type {Sample} */ b) => a.observedAt - b.observedAt);
-      state.data[key] = rows;
-    }
-    state.decimated = Boolean(json.decimated);
-    state.error = null;
-  } catch (e) {
-    if (seq !== fetchSeq) return;
-    state.error = String((e && /** @type {Error} */ (e).message) || e);
+/** @returns {string} */
+function selectorQuery() {
+  const query = new URLSearchParams();
+  for (const provider of PROVIDERS) {
+    const key = state.selectedAccounts[provider];
+    if (key) query.set(provider, key);
   }
-  renderFooter();
+  return query.toString();
+}
+
+async function fetchAccounts() {
+  const response = await fetch('/api/accounts', { cache: 'no-store' });
+  if (!response.ok) throw new Error('accounts');
+  const json = await response.json();
+  if (json.available === false) {
+    state.accountGroups = {};
+    configureAccountSelectors(true);
+    return;
+  }
+  state.accountGroups = json.providers && typeof json.providers === 'object' ? json.providers : {};
+  if (Number.isFinite(json.now)) state.now = json.now;
+  const before = { ...state.selectedAccounts };
+  configureAccountSelectors(false);
+  for (const provider of PROVIDERS) {
+    if (before[provider] !== state.selectedAccounts[provider]) {
+      discardIdentifierDialog();
+      clearProvider(provider);
+    }
+  }
+  renderHeader();
   scheduleDraw();
 }
 
-async function fetchLatest() {
+async function fetchData() {
+  const sequence = ++fetchSeq;
+  fetchController?.abort();
+  const controller = new AbortController();
+  fetchController = controller;
+  const { from, to } = currentRange();
+  const query = selectorQuery();
+  const suffix = query ? `&${query}` : '';
+  for (const group of Object.values(providerGroups)) group.setAttribute('aria-busy', 'true');
   try {
-    const res = await fetch('/api/latest', { cache: 'no-store' });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = await res.json();
+    const [samplesResponse, latestResponse] = await Promise.all([
+      fetch(`/api/samples?from=${Math.round(from)}&to=${Math.round(to)}${suffix}`, { cache: 'no-store', signal: controller.signal }),
+      fetch(`/api/latest?${query}`, { cache: 'no-store', signal: controller.signal }),
+    ]);
+    if (!samplesResponse.ok || !latestResponse.ok) throw new Error('data');
+    const [samplesJson, latestJson] = await Promise.all([samplesResponse.json(), latestResponse.json()]);
+    if (sequence !== fetchSeq) return;
     for (const key of SERIES_KEYS) {
-      state.latest[key] = (json.series && json.series[key]) || null;
+      const rows = Array.isArray(samplesJson.series?.[key]) ? samplesJson.series[key] : [];
+      rows.sort((left, right) => left.observedAt - right.observedAt);
+      state.data[key] = rows;
+      state.latest[key] = latestJson.series?.[key] ?? null;
     }
-  } catch {
-    /* ヘッダの表示だけなので握りつぶす */
+    state.decimated = Boolean(samplesJson.decimated);
+    state.error = null;
+  } catch (error) {
+    if (sequence !== fetchSeq || error?.name === 'AbortError') return;
+    state.error = '取得に失敗しました';
   }
+  if (sequence === fetchSeq) {
+    for (const group of Object.values(providerGroups)) group.setAttribute('aria-busy', 'false');
+    renderHeader();
+    renderFooter();
+    scheduleDraw();
+  }
+}
+
+/** @param {string} provider */
+function clearProvider(provider) {
+  for (const key of SERIES_KEYS) {
+    if (!key.startsWith(`${provider}/`)) continue;
+    state.data[key] = [];
+    state.latest[key] = null;
+    const panel = panels.find((candidate) => candidate.key === key);
+    if (panel) panel.hover = null;
+  }
+}
+
+/** @param {string} provider @param {string} key */
+function selectAccount(provider, key) {
+  if (state.selectedAccounts[provider] === key) return;
+  discardIdentifierDialog();
+  clearProvider(provider);
+  state.selectedAccounts[provider] = key;
+  state.savedSelections[provider] = key;
+  savePrefs();
+  fetchController?.abort();
+  fetchSeq += 1;
   renderHeader();
+  scheduleDraw();
+  void fetchData();
 }
 
 // ---------------------------------------------------------------- DOM 構築
 
-/**
- * @param {string} tag
- * @param {string} [cls]
- * @param {string} [text]
- */
-function el(tag, cls, text) {
-  const n = document.createElement(tag);
-  if (cls) n.className = cls;
-  if (text != null) n.textContent = text;
-  return n;
+/** @param {string} tag @param {string} [className] @param {string} [content] */
+function el(tag, className, content) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (content != null) node.textContent = content;
+  return node;
 }
 
-/**
- * @param {{label:string, options:[string,string][], value:string}} spec
- */
+/** @param {{label:string,options:[string,string][],value:string}} spec */
 function makeControl(spec) {
   const wrap = el('label', 'ctrl');
   wrap.appendChild(el('span', undefined, spec.label));
-  const sel = /** @type {HTMLSelectElement} */ (document.createElement('select'));
-  sel.title = spec.label;
+  const select = /** @type {HTMLSelectElement} */ (document.createElement('select'));
   for (const [value, text] of spec.options) {
-    const opt = document.createElement('option');
-    opt.value = value;
-    opt.textContent = text;
-    sel.appendChild(opt);
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = text;
+    select.appendChild(option);
   }
-  sel.value = spec.value;
-  wrap.appendChild(sel);
-  return { wrap, sel };
+  select.value = spec.value;
+  wrap.appendChild(select);
+  return { wrap, select };
 }
 
-/**
- * @param {SeriesKey} key
- * @returns {Panel}
- */
+/** @param {SeriesKey} key @returns {Panel} */
 function buildPanel(key) {
-  const def = SERIES[key];
-  const ps = state.panels[key];
-
+  const definition = SERIES[key];
+  const panelState = state.panels[key];
   const root = el('section', 'panel');
   const head = el('div', 'panel-head');
-
   const title = el('div', 'panel-title');
   const dot = el('span', 'dot');
-  dot.style.background = def.color;
-  title.appendChild(dot);
-  title.appendChild(el('span', 't', def.title));
+  dot.style.background = definition.color;
+  title.append(dot, el('span', 't', definition.title));
   head.appendChild(title);
-
-  const ctrls = el('div', 'panel-ctrls');
-  const period = makeControl({
-    label: '集計期間',
-    options: PERIODS.map(([id, label]) => [id, label]),
-    value: state.period,
-  });
-  const mode = makeControl({
-    label: 'グラフ形式',
-    options: [
-      ['line', '折れ線'],
-      ['bar', '棒グラフ'],
-    ],
-    value: ps.mode,
-  });
-  const points = makeControl({
-    label: 'プロットの表示',
-    options: [
-      ['on', 'あり'],
-      ['off', 'なし'],
-    ],
-    value: ps.points ? 'on' : 'off',
-  });
-  ctrls.append(period.wrap, mode.wrap, points.wrap);
-  head.appendChild(ctrls);
-  root.appendChild(head);
-
-  root.appendChild(el('div', 'panel-sub', '使用率（使った割合）%　0〜100'));
-
-  const wrap = el('div', 'canvas-wrap');
+  const controls = el('div', 'panel-ctrls');
+  const period = makeControl({ label: '集計期間', options: PERIODS.map(([id, label]) => [id, label]), value: state.period });
+  const mode = makeControl({ label: 'グラフ形式', options: [['line', '折れ線'], ['bar', '棒グラフ']], value: panelState.mode });
+  const points = makeControl({ label: 'プロットの表示', options: [['on', 'あり'], ['off', 'なし']], value: panelState.points ? 'on' : 'off' });
+  controls.append(period.wrap, mode.wrap, points.wrap);
+  head.appendChild(controls);
+  root.append(head, el('div', 'panel-sub', '使用率（使った割合）%　0〜100'));
+  const canvasWrap = el('div', 'canvas-wrap');
   const canvas = /** @type {HTMLCanvasElement} */ (document.createElement('canvas'));
-  wrap.appendChild(canvas);
-  root.appendChild(wrap);
-
-  /** @type {Panel} */
-  const panel = {
-    key,
-    root,
-    canvas,
-    periodSel: period.sel,
-    modeSel: mode.sel,
-    pointsSel: points.sel,
-    rect: null,
-    hover: null,
-  };
-
-  period.sel.addEventListener('change', () => {
-    const v = /** @type {'24h'|'7d'|'30d'|'custom'} */ (period.sel.value);
-    if (v === 'custom') {
-      // 直接「カスタム」を選んだときは現在の範囲をそのまま固定する
-      const r = currentRange();
-      state.custom = { from: r.from, to: r.to };
-    }
-    state.period = v;
-    for (const p of panels) p.periodSel.value = v; // 全パネル連動
+  canvasWrap.appendChild(canvas);
+  root.appendChild(canvasWrap);
+  const panel = { key, root, canvas, periodSel: period.select, modeSel: mode.select, pointsSel: points.select, rect: null, hover: null };
+  period.select.addEventListener('change', () => {
+    const value = /** @type {'24h'|'7d'|'30d'|'custom'} */ (period.select.value);
+    if (value === 'custom') state.custom = currentRange();
+    state.period = value;
+    for (const other of panels) other.periodSel.value = value;
     savePrefs();
     scheduleDraw();
     scheduleFetch();
   });
-  mode.sel.addEventListener('change', () => {
-    state.panels[key].mode = /** @type {'line'|'bar'} */ (mode.sel.value);
+  mode.select.addEventListener('change', () => {
+    state.panels[key].mode = /** @type {'line'|'bar'} */ (mode.select.value);
     savePrefs();
     scheduleDraw();
   });
-  points.sel.addEventListener('change', () => {
-    state.panels[key].points = points.sel.value === 'on';
+  points.select.addEventListener('change', () => {
+    state.panels[key].points = points.select.value === 'on';
     savePrefs();
     scheduleDraw();
   });
-
   attachInteractions(panel);
   return panel;
 }
 
-/**
- * ホイールズーム / ドラッグパン / ホバー。
- * @param {Panel} panel
- */
+/** @param {string} provider @returns {HTMLElement} */
+function buildProviderGroup(provider) {
+  const title = provider === 'claude' ? 'Claude Code' : 'Codex CLI';
+  const section = el('section', 'provider-group');
+  const headingId = `${provider}-heading`;
+  section.setAttribute('aria-labelledby', headingId);
+  const header = el('div', 'provider-header');
+  const heading = el('h2', undefined, title);
+  heading.id = headingId;
+  const accountControl = el('div', 'account-control');
+  const selectId = `${provider}-account`;
+  const label = el('label', undefined, '表示アカウント:');
+  label.htmlFor = selectId;
+  const select = /** @type {HTMLSelectElement} */ (document.createElement('select'));
+  select.id = selectId;
+  select.addEventListener('change', () => selectAccount(provider, select.value));
+  const currentNote = el('span', 'current-account-note');
+  currentNote.setAttribute('aria-live', 'polite');
+  const reveal = /** @type {HTMLButtonElement} */ (document.createElement('button'));
+  reveal.type = 'button';
+  reveal.className = 'reveal-button';
+  reveal.textContent = '実IDを確認';
+  reveal.hidden = true;
+  reveal.addEventListener('click', () => { void revealIdentifier(provider, reveal); });
+  accountControl.append(label, select, currentNote, reveal);
+  header.append(heading, accountControl);
+  const chartGrid = el('div', 'provider-chart-grid');
+  for (const key of SERIES_KEYS.filter((seriesKey) => seriesKey.startsWith(`${provider}/`))) {
+    const panel = buildPanel(key);
+    panels.push(panel);
+    chartGrid.appendChild(panel.root);
+  }
+  section.append(header, chartGrid);
+  accountSelects[provider] = select;
+  currentAccountNotes[provider] = currentNote;
+  revealButtons[provider] = reveal;
+  providerGroups[provider] = section;
+  return section;
+}
+
+/** @param {boolean} unavailable */
+function configureAccountSelectors(unavailable) {
+  if (unavailable || !state.meta?.canRevealAccountIdentifiers) discardIdentifierDialog();
+  for (const provider of PROVIDERS) {
+    const select = accountSelects[provider];
+    const note = currentAccountNotes[provider];
+    const reveal = revealButtons[provider];
+    if (!select || !note || !reveal) continue;
+    select.textContent = '';
+    if (unavailable) {
+      const option = document.createElement('option');
+      option.textContent = 'アカウント情報を利用できません';
+      option.value = '';
+      select.appendChild(option);
+      select.disabled = true;
+      note.textContent = 'DB移行未完了のためアカウント別表示は無効';
+      reveal.hidden = true;
+      continue;
+    }
+    const group = state.accountGroups[provider] ?? { resolution: 'pending', currentAccountKey: null, accounts: [] };
+    const selected = chooseAccountSelection(group, state.savedSelections[provider]);
+    state.selectedAccounts[provider] = selected;
+    for (const account of group.accounts ?? []) {
+      const option = document.createElement('option');
+      option.value = account.accountKey;
+      option.textContent = account.isCurrent ? `${account.label}（現在ログイン中）` : account.label;
+      select.appendChild(option);
+    }
+    if (select.options.length === 0) {
+      const option = document.createElement('option');
+      option.value = '';
+      option.textContent = 'アカウントを確認中';
+      select.appendChild(option);
+    }
+    select.disabled = !selected;
+    select.value = selected ?? '';
+    const current = (group.accounts ?? []).find((account) => account.accountKey === group.currentAccountKey);
+    note.textContent = current && selected !== current.accountKey ? `現在ログイン中: ${current.label}` : '';
+    reveal.hidden = !(state.meta?.canRevealAccountIdentifiers && selected && !selected.endsWith(':unknown'));
+  }
+}
+
+// ---------------------------------------------------------------- 実 ID 確認
+
+/** 設定変更・meta 失敗・世代変更時に実 ID の request と DOM を破棄する。 */
+function discardIdentifierDialog() {
+  revealGeneration += 1;
+  const active = activeIdentifierDialog;
+  activeIdentifierDialog = null;
+  active?.controller?.abort();
+  if (active?.dialog) {
+    try {
+      active.dialog.close();
+    } catch {
+      active.dialog.remove();
+    }
+    active.dialog.remove();
+  }
+}
+
+/** @param {string} provider @param {HTMLButtonElement} opener */
+async function revealIdentifier(provider, opener) {
+  const account = state.selectedAccounts[provider];
+  if (!account || !window.confirm('選択中のアカウントの実IDを確認しますか？')) return;
+  discardIdentifierDialog();
+  const generation = revealGeneration;
+  const controller = new AbortController();
+  activeIdentifierDialog = { dialog: null, controller, opener };
+  try {
+    const query = new URLSearchParams({ provider, account });
+    const response = await fetch(`/api/account-identifier?${query}`, { cache: 'no-store', signal: controller.signal });
+    if (!response.ok) throw new Error('identifier');
+    const json = await response.json();
+    if (generation !== revealGeneration || !state.meta?.canRevealAccountIdentifiers) return;
+    showIdentifierDialog(json.account, opener, controller);
+  } catch {
+    /* 実 ID が無い失敗を通常画面には出さない。 */
+  } finally {
+    if (generation === revealGeneration && activeIdentifierDialog?.dialog === null) {
+      activeIdentifierDialog = null;
+    }
+  }
+}
+
+/** @param {{uuid?:string|null,email?:string|null}} account @param {HTMLButtonElement} opener @param {AbortController} controller */
+function showIdentifierDialog(account, opener, controller) {
+  const dialog = /** @type {HTMLDialogElement} */ (document.createElement('dialog'));
+  dialog.className = 'identifier-dialog';
+  const title = el('h2', undefined, '実IDの確認');
+  const body = el('div', 'identifier-values');
+  body.appendChild(el('p', undefined, account.uuid || 'UUID はありません'));
+  body.appendChild(el('p', undefined, account.email || 'メールアドレスはありません'));
+  const close = /** @type {HTMLButtonElement} */ (document.createElement('button'));
+  close.type = 'button';
+  close.textContent = '閉じる';
+  const dispose = () => {
+    dialog.remove();
+    if (activeIdentifierDialog?.dialog === dialog) activeIdentifierDialog = null;
+    opener.focus();
+  };
+  close.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', dispose, { once: true });
+  dialog.append(title, body, close);
+  document.body.appendChild(dialog);
+  activeIdentifierDialog = { dialog, controller, opener };
+  dialog.showModal();
+}
+
+// ---------------------------------------------------------------- 操作
+
+/** @param {Panel} panel */
 function attachInteractions(panel) {
   const canvas = panel.canvas;
-
-  canvas.addEventListener(
-    'wheel',
-    (ev) => {
-      ev.preventDefault();
-      const rect = panel.rect;
-      if (!rect) return;
-      const box = canvas.getBoundingClientRect();
-      const mx = Math.max(rect.x, Math.min(rect.x + rect.w, ev.clientX - box.left));
-      const { from, to } = currentRange();
-      const anchor = xToTime(mx, from, to, rect);
-      const factor = ev.deltaY < 0 ? 0.8 : 1.25;
-      const span = Math.max(MIN_RANGE_MS, (to - from) * factor);
-      const ratio = (anchor - from) / (to - from);
-      const nf = anchor - ratio * span;
-      setCustomRange(nf, nf + span);
-    },
-    { passive: false },
-  );
-
-  /** @type {{x:number, from:number, to:number, moved:boolean}|null} */
+  canvas.addEventListener('wheel', (event) => {
+    event.preventDefault();
+    if (!panel.rect) return;
+    const bounds = canvas.getBoundingClientRect();
+    const mouseX = Math.max(panel.rect.x, Math.min(panel.rect.x + panel.rect.w, event.clientX - bounds.left));
+    const range = currentRange();
+    const anchor = xToTime(mouseX, range.from, range.to, panel.rect);
+    const span = Math.max(MIN_RANGE_MS, (range.to - range.from) * (event.deltaY < 0 ? 0.8 : 1.25));
+    const ratio = (anchor - range.from) / (range.to - range.from);
+    setCustomRange(anchor - ratio * span, anchor + (1 - ratio) * span);
+  }, { passive: false });
+  /** @type {{x:number,from:number,to:number,moved:boolean}|null} */
   let drag = null;
-
-  canvas.addEventListener('pointerdown', (ev) => {
-    if (ev.button !== 0 || !panel.rect) return;
-    const r = currentRange();
-    drag = { x: ev.clientX, from: r.from, to: r.to, moved: false };
-    canvas.setPointerCapture(ev.pointerId);
+  canvas.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || !panel.rect) return;
+    const range = currentRange();
+    drag = { x: event.clientX, from: range.from, to: range.to, moved: false };
+    canvas.setPointerCapture(event.pointerId);
     canvas.style.cursor = 'grabbing';
   });
-
-  canvas.addEventListener('pointermove', (ev) => {
-    const box = canvas.getBoundingClientRect();
+  canvas.addEventListener('pointermove', (event) => {
+    const bounds = canvas.getBoundingClientRect();
     if (drag && panel.rect) {
-      const dx = ev.clientX - drag.x;
-      if (Math.abs(dx) > 2) drag.moved = true;
+      const deltaX = event.clientX - drag.x;
+      if (Math.abs(deltaX) > 2) drag.moved = true;
       if (drag.moved) {
-        const span = drag.to - drag.from;
-        const shift = (dx / panel.rect.w) * span;
+        const shift = (deltaX / panel.rect.w) * (drag.to - drag.from);
         panel.hover = null;
         setCustomRange(drag.from - shift, drag.to - shift);
         return;
       }
     }
-    panel.hover = { x: ev.clientX - box.left, y: ev.clientY - box.top };
+    panel.hover = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
     scheduleDraw();
   });
-
-  const endDrag = (/** @type {PointerEvent} */ ev) => {
+  const endDrag = (event) => {
     if (!drag) return;
     drag = null;
     canvas.style.cursor = 'crosshair';
     try {
-      canvas.releasePointerCapture(ev.pointerId);
+      canvas.releasePointerCapture(event.pointerId);
     } catch {
-      /* noop */
+      /* pointer が既に解放済みでも問題にしない。 */
     }
   };
   canvas.addEventListener('pointerup', endDrag);
@@ -398,95 +548,67 @@ function attachInteractions(panel) {
   });
 }
 
-// ---------------------------------------------------------------- リセット予定
-
-/**
- * パネルの「次回リセット予定」時刻。`/api/latest` の newest ok サンプルの
- * `resetsAt` を優先し、無ければ `state.data[key]` 内の最後の ok サンプルにフォールバックする。
- * @param {SeriesKey} key
- * @returns {number|null}
- */
+/** @param {SeriesKey} key @returns {number|null} */
 function nextResetAtFor(key) {
   const latest = state.latest[key];
-  if (latest && latest.status === 'ok' && Number.isFinite(latest.resetsAt)) {
-    return latest.resetsAt;
-  }
-  const samples = state.data[key] || [];
-  for (let i = samples.length - 1; i >= 0; i--) {
-    const s = samples[i];
-    if (s.status === 'ok' && Number.isFinite(s.resetsAt)) return s.resetsAt;
+  if (latest?.status === 'ok' && Number.isFinite(latest.resetsAt)) return latest.resetsAt;
+  for (const sample of [...(state.data[key] ?? [])].reverse()) {
+    if (sample.status === 'ok' && Number.isFinite(sample.resetsAt)) return sample.resetsAt;
   }
   return null;
 }
 
 // ---------------------------------------------------------------- 描画
 
-let rafId = 0;
+let frame = 0;
 
 function scheduleDraw() {
-  if (rafId) return;
-  rafId = requestAnimationFrame(() => {
-    rafId = 0;
-    drawAll();
+  if (frame) return;
+  frame = requestAnimationFrame(() => {
+    frame = 0;
+    const range = currentRange();
+    const now = state.period === 'custom' ? Math.max(state.now, Date.now()) : state.now;
+    for (const panel of panels) {
+      const definition = SERIES[panel.key];
+      const samples = state.data[panel.key] ?? [];
+      panel.rect = drawChart(panel.canvas, {
+        samples,
+        from: range.from,
+        to: range.to,
+        now,
+        gaps: computeGaps(samples, { from: range.from, to: range.to, now, factor: GAP_FACTOR }),
+        color: definition.color,
+        legendLabel: definition.legend,
+        mode: state.panels[panel.key].mode,
+        showPoints: state.panels[panel.key].points,
+        hover: panel.hover,
+        nextResetAt: nextResetAtFor(panel.key),
+      });
+    }
   });
-}
-
-function drawAll() {
-  const { from, to } = currentRange();
-  const now = state.period === 'custom' ? Math.max(state.now, Date.now()) : state.now;
-  for (const panel of panels) {
-    const def = SERIES[panel.key];
-    const samples = state.data[panel.key] || [];
-    const ps = state.panels[panel.key];
-    const gaps = computeGaps(samples, { from, to, now, factor: GAP_FACTOR });
-    panel.rect = drawChart(panel.canvas, {
-      samples,
-      from,
-      to,
-      now,
-      gaps,
-      color: def.color,
-      legendLabel: def.legend,
-      mode: ps.mode,
-      showPoints: ps.points,
-      hover: panel.hover,
-      nextResetAt: nextResetAtFor(panel.key),
-    });
-  }
 }
 
 function renderHeader() {
   const box = document.getElementById('currentValues');
-  const lf = document.getElementById('lastFetch');
-  if (!box || !lf) return;
+  const lastFetch = document.getElementById('lastFetch');
+  if (!box || !lastFetch) return;
   box.textContent = '';
   let newest = 0;
   for (const key of SERIES_KEYS) {
-    const def = SERIES[key];
-    const s = state.latest[key];
+    const definition = SERIES[key];
+    const sample = state.latest[key];
     const item = el('span', 'current-value');
     const dot = el('span', 'dot');
-    dot.style.background = def.color;
-    item.appendChild(dot);
-    item.appendChild(el('span', undefined, def.short));
-    if (s && s.status === 'ok' && s.usedPercent != null) {
-      const b = el('b', undefined, `${Math.round(s.usedPercent)}%`);
-      item.appendChild(b);
-    } else {
-      item.classList.add('is-error');
-      item.appendChild(el('b', undefined, '--'));
-      if (s && s.errorCode) item.title = s.errorCode;
-    }
-    const nextResetAt = nextResetAtFor(key);
-    if (nextResetAt != null) {
-      item.appendChild(
-        el('span', 'reset-suffix', ` · リセット ${formatClockLabel(nextResetAt, state.now)}`),
-      );
-    }
-    if (s && Number.isFinite(s.observedAt)) newest = Math.max(newest, s.observedAt);
+    dot.style.background = definition.color;
+    item.append(dot, el('span', undefined, definition.short));
+    item.appendChild(el('b', undefined, sample?.status === 'ok' && sample.usedPercent != null ? `${Math.round(sample.usedPercent)}%` : '--'));
+    if (sample?.status !== 'ok') item.classList.add('is-error');
+    const resetAt = nextResetAtFor(key);
+    if (resetAt != null) item.appendChild(el('span', 'reset-suffix', ` · リセット ${formatClockLabel(resetAt, state.now)}`));
+    if (Number.isFinite(sample?.observedAt)) newest = Math.max(newest, sample.observedAt);
     box.appendChild(item);
   }
-  lf.textContent = newest ? `最終取得 ${formatDateTime(newest)}` : '最終取得 —';
+  lastFetch.textContent = newest ? `最終取得 ${formatDateTime(newest)}` : '最終取得 —';
 }
 
 function renderFooter() {
@@ -494,56 +616,52 @@ function renderFooter() {
   const note = document.getElementById('footerNote');
   if (!info || !note) return;
   if (state.meta) {
-    info.textContent = `取得間隔 ${state.meta.pollIntervalSec} 秒　DB: ${state.meta.dbPath}`;
+    info.textContent = `取得間隔 ${state.meta.pollIntervalSec} 秒　DB: quota-trail.sqlite　${state.meta.backend}`;
   } else {
     info.textContent = 'メタ情報を取得できません';
   }
   const notes = [];
   if (state.decimated) notes.push('表示件数が多いため間引き表示中');
-  if (state.error) notes.push(`取得エラー: ${state.error}`);
+  if (state.error) notes.push(state.error);
   note.textContent = notes.join('　');
 }
 
-// ---------------------------------------------------------------- 起動
-
-function main() {
+async function main() {
   loadPrefs();
-
-  const grid = /** @type {HTMLElement} */ (document.getElementById('grid'));
-  for (const key of SERIES_KEYS) {
-    const panel = buildPanel(key);
-    panels.push(panel);
-    grid.appendChild(panel.root);
-  }
-
-  const ro = new ResizeObserver(() => scheduleDraw());
-  for (const p of panels) ro.observe(p.canvas.parentElement || p.canvas);
+  const groups = document.getElementById('providerGroups');
+  if (!groups) return;
+  for (const provider of PROVIDERS) groups.appendChild(buildProviderGroup(provider));
+  const observer = new ResizeObserver(() => scheduleDraw());
+  for (const panel of panels) observer.observe(panel.canvas.parentElement ?? panel.canvas);
   window.addEventListener('resize', scheduleDraw);
-
   renderHeader();
   renderFooter();
   scheduleDraw();
-
-  fetchMeta();
-  fetchSamples();
-  fetchLatest();
-
-  // 24h / 7d / 30d は now に追従（カスタムは固定）
+  await fetchMeta();
+  try {
+    await fetchAccounts();
+  } catch {
+    configureAccountSelectors(false);
+  }
+  void fetchData();
   setInterval(() => {
-    state.now = Date.now();
-    if (state.period !== 'custom') {
-      fetchSamples();
-    }
-    fetchLatest();
+    void (async () => {
+      await fetchMeta();
+      try {
+        await fetchAccounts();
+      } catch {
+        /* 一時的な一覧取得失敗では現在の選択を残す。 */
+      }
+      await fetchData();
+    })();
   }, FOLLOW_INTERVAL_MS);
 }
 
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', main);
+  document.addEventListener('DOMContentLoaded', () => { void main(); });
 } else {
-  main();
+  void main();
 }
 
-// デバッグ用（Chrome の devtools から状態を覗けるように）
 // @ts-ignore
 window.__quotaTrail = { state, panels, nearestSample };

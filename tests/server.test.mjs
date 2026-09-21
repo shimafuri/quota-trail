@@ -41,6 +41,20 @@ function fakeDb() {
     backend: 'fake',
     latest: () => ({ 'claude/5h': s, 'claude/weekly': null, 'codex/5h': null, 'codex/weekly': null }),
     queryAllSeries: () => ({ 'claude/5h': [s], 'claude/weekly': [], 'codex/5h': [], 'codex/weekly': [] }),
+    accountDimensionAvailable: true,
+    listAccounts: () => [{ provider:'claude', accountKey:'claude:1', label:'アカウント1' }],
+    hasUnknownSamples: (provider) => provider === 'codex',
+    resolveAccountKey: (p, k) => k === `${p}:unknown` ? null : (k === `${p}:1` ? 42 : 'invalid'),
+    accountIdentifier: () => ({ uuid:'11111111-1111-4111-8111-111111111111', email:'private@example.com' }),
+  };
+}
+
+function fakeAccountManager() {
+  return {
+    accounts: () => [{ provider:'claude', accountKey:'claude:1', label:'アカウント1', isCurrent:true }],
+    current: (provider) => provider === 'claude'
+      ? { status:'known', accountKey:'claude:1', accountId:42 }
+      : { status:'unknown', accountKey:null, accountId:null },
   };
 }
 
@@ -50,6 +64,7 @@ test('HTTP API: /api/meta, /api/latest, /api/samples', async (t) => {
     readConfig: () => ({ pollIntervalSec: 180, port: 0 }),
     appRoot,
     getAutostart: () => true,
+    accountManager: fakeAccountManager(),
   });
   t.after(() => server.close());
   const base = server.url.replace(/\/$/, '');
@@ -61,6 +76,19 @@ test('HTTP API: /api/meta, /api/latest, /api/samples', async (t) => {
   assert.equal(typeof meta.now, 'number');
   assert.equal(meta.dbPath, 'C:/tmp/fake.sqlite');
   assert.equal(meta.autostart, true);
+  assert.equal(meta.accountDimensionAvailable, true);
+
+  const accounts = await (await fetch(`${base}/api/accounts`)).json();
+  assert.equal(accounts.providers.claude.resolution, 'known');
+  assert.equal(accounts.providers.claude.currentAccountKey, 'claude:1');
+  assert.deepEqual(accounts.providers.claude.accounts, [{
+    accountKey: 'claude:1', label: 'アカウント1', isCurrent: true, kind: 'known',
+  }]);
+  assert.equal(accounts.providers.codex.accounts[0].accountKey, 'codex:unknown');
+  const serializedAccounts = JSON.stringify(accounts);
+  assert.equal(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(serializedAccounts), false);
+  assert.equal(/[^\s"]+@[^\s"]+/.test(serializedAccounts), false);
+  assert.equal(/"(?:id|accountId)"\s*:/.test(serializedAccounts), false);
 
   const latest = await (await fetch(`${base}/api/latest`)).json();
   assert.equal(latest.series['claude/5h'].usedPercent, 41.5);

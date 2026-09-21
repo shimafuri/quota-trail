@@ -8,6 +8,7 @@ import * as logger from './logger.mjs';
  * @property {number} pollIntervalSec  取得間隔（秒）。既定 180、最小 30
  * @property {number} port             HTTP サーバのポート。既定 47811
  * @property {number|null} retentionDays  保持日数。null = 無制限
+ * @property {boolean} revealAccountIdentifiers 実 ID の明示表示を許可するか
  */
 
 /** @type {Config} */
@@ -15,6 +16,7 @@ export const DEFAULTS = Object.freeze({
   pollIntervalSec: 180,
   port: 47811,
   retentionDays: null,
+  revealAccountIdentifiers: false,
 });
 
 export const MIN_POLL_INTERVAL_SEC = 30;
@@ -64,7 +66,8 @@ export function sanitizeConfig(raw) {
     retentionDays = Number.isFinite(n) && n > 0 ? Math.round(n) : null;
   }
 
-  return { pollIntervalSec, port, retentionDays };
+  const revealAccountIdentifiers = src.revealAccountIdentifiers === true;
+  return { pollIntervalSec, port, retentionDays, revealAccountIdentifiers };
 }
 
 /**

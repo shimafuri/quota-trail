@@ -82,13 +82,14 @@ function sendText(res, status, text) {
 /**
  * @param {Object} deps
  * @param {any} deps.db
- * @param {() => {pollIntervalSec:number, port:number}} deps.readConfig
+ * @param {() => {pollIntervalSec:number, port:number, revealAccountIdentifiers?:boolean}} deps.readConfig
+ * @param {any} [deps.accountManager]
  * @param {string} deps.appRoot   リポジトリ／アプリのルート
  * @param {(port:number) => void} [deps.onPort]  実際に bind したポートの通知
  * @param {() => boolean} [deps.getAutostart]  Windows 自動起動が有効かどうか（省略時は false）
  * @returns {Promise<{port:number, url:string, close:()=>Promise<void>}>}
  */
-export async function startServer({ db, readConfig, appRoot, onPort, getAutostart }) {
+export async function startServer({ db, readConfig, appRoot, onPort, getAutostart, accountManager }) {
   const rendererDir = path.join(appRoot, 'src', 'renderer');
   const sharedDir = path.join(appRoot, 'src', 'shared');
 
@@ -120,12 +121,85 @@ export async function startServer({ db, readConfig, appRoot, onPort, getAutostar
         dbPath: db.dbPath,
         backend: db.backend,
         autostart,
+        accountDimensionAvailable: db.accountDimensionAvailable !== false,
+        canRevealAccountIdentifiers: cfg.revealAccountIdentifiers === true,
       });
       return;
     }
 
+    if (pathname === '/api/accounts') {
+      if (db.accountDimensionAvailable === false) {
+        sendJson(res, 200, { available: false, now: Date.now() });
+        return;
+      }
+      const accounts = accountManager?.accounts?.() ?? (db.listAccounts?.() ?? []);
+      /** @type {Record<string, any>} */
+      const providers = {};
+      for (const provider of ['claude', 'codex']) {
+        const current = accountManager?.current?.(provider) ?? {
+          status: 'unknown', accountKey: null,
+        };
+        const resolution = ['pending', 'known', 'unknown'].includes(current.status)
+          ? current.status
+          : 'unknown';
+        const currentAccountKey = resolution === 'unknown'
+          ? `${provider}:unknown`
+          : current.accountKey ?? null;
+        const rows = accounts
+          .filter((account) => account.provider === provider)
+          .map((account) => ({
+            accountKey: account.accountKey,
+            label: account.label,
+            isCurrent: account.accountKey === currentAccountKey,
+            kind: 'known',
+          }));
+        if (resolution === 'unknown' || db.hasUnknownSamples?.(provider) === true) {
+          rows.push({
+            accountKey: `${provider}:unknown`,
+            label: '不明なアカウント',
+            isCurrent: currentAccountKey === `${provider}:unknown`,
+            kind: 'unknown',
+          });
+        }
+        providers[provider] = { resolution, currentAccountKey, accounts: rows };
+      }
+      // 行には DB と account manager が作る匿名 DTO だけを含める。
+      sendJson(res, 200, { providers, now: Date.now() });
+      return;
+    }
+
+    const selectors = () => {
+      if (db.accountDimensionAvailable === false) {
+        return { claude: null, codex: null };
+      }
+      const out = {};
+      for (const provider of ['claude', 'codex']) {
+        const key = url.searchParams.get(provider);
+        if (key === null) { out[provider] = accountManager?.current?.(provider)?.accountId ?? null; continue; }
+        const id = db.resolveAccountKey?.(provider, key);
+        if (id === 'invalid') return null;
+        out[provider] = id;
+      }
+      return out;
+    };
+
+    if (pathname === '/api/account-identifier') {
+      const cfg = readConfig();
+      const provider = url.searchParams.get('provider');
+      const key = url.searchParams.get('account');
+      if (cfg.revealAccountIdentifiers !== true || !['claude', 'codex'].includes(provider) || !key) { sendJson(res, 404, { error: 'not found' }); return; }
+      const id = db.resolveAccountKey?.(provider, key);
+      if (id === 'invalid' || id === null) { sendJson(res, 400, { error: 'invalid account selector' }); return; }
+      const account = db.accountIdentifier?.(provider, id);
+      if (!account) { sendJson(res, 404, { error: 'not found' }); return; }
+      sendJson(res, 200, { account });
+      return;
+    }
+
     if (pathname === '/api/latest') {
-      sendJson(res, 200, { series: db.latest(), now: Date.now() });
+      const accountIdsByProvider = selectors();
+      if (!accountIdsByProvider) { sendJson(res, 400, { error: 'invalid account selector' }); return; }
+      sendJson(res, 200, { series: db.latest({ accountIdsByProvider }), now: Date.now() });
       return;
     }
 
@@ -142,7 +216,9 @@ export async function startServer({ db, readConfig, appRoot, onPort, getAutostar
         sendJson(res, 400, { error: 'to は from 以上である必要があります' });
         return;
       }
-      const raw = db.queryAllSeries({ from, to });
+      const accountIdsByProvider = selectors();
+      if (!accountIdsByProvider) { sendJson(res, 400, { error: 'invalid account selector' }); return; }
+      const raw = db.queryAllSeries({ from, to, accountIdsByProvider });
       /** @type {Record<string, any[]>} */
       const series = {};
       let decimated = false;

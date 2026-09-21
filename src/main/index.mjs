@@ -1,5 +1,5 @@
 // Electron エントリ（設計書 §3 / §8）
-// single-instance lock → config → logger → db → server → tray → scheduler
+// single-instance lock → config → logger → db → 初回 identity/backfill → server → tray → scheduler
 import { app, powerMonitor } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -9,10 +9,12 @@ import { initConfig, readConfig, writeConfig } from './config.mjs';
 import { openDb } from './db.mjs';
 import { startServer } from './server.mjs';
 import { createScheduler } from './scheduler.mjs';
+import { createAccountManager } from './account-manager.mjs';
 import { createTray } from './tray.mjs';
 import * as autostart from './autostart.mjs';
 import * as claude from './providers/claude.mjs';
 import * as codex from './providers/codex.mjs';
+import { resolveInitialIdentityWithinBudget } from './lib/startup-identity.mjs';
 
 /** @type {ReturnType<typeof openDb>|null} */
 let db = null;
@@ -22,6 +24,7 @@ let server = null;
 let scheduler = null;
 /** @type {ReturnType<typeof createTray>|null} */
 let tray = null;
+let accountManager = null;
 let quitting = false;
 /** will-quit で理由を出すための記録。'tray-menu' | 'second-instance' | 'signal:<name>' | 'power-shutdown' | 'unknown' */
 let quitReason = 'unknown';
@@ -31,6 +34,7 @@ let lastAliveTimer = null;
 let lastAlivePath = null;
 
 const appRoot = app.getAppPath();
+const INITIAL_IDENTITY_TIMEOUT_MS = 3_000;
 
 // --- 単一インスタンス --------------------------------------------------------
 const gotLock = app.requestSingleInstanceLock();
@@ -133,6 +137,7 @@ async function main() {
   const dbFile = path.join(userData, 'quota-trail.sqlite');
   db = openDb(dbFile);
   logger.info('DB を開いた', { dbPath: dbFile, backend: db.backend });
+  accountManager = createAccountManager({ db });
 
   // 保持期間（設定されていれば起動時に一度だけ削除）
   const cfg0 = readConfig();
@@ -147,9 +152,26 @@ async function main() {
     logger.info('User-Agent を決定', { claude: claude.userAgent(), codex: codex.userAgent() });
   });
 
+  // 初期画面の既定選択が別 account にならないよう、公開前に current/backfill を確定する。
+  // profile が遅い・資格情報が無い場合でも 3 秒で unknown として先へ進む。
+  const initialContext = { observedAt: Date.now(), intervalSec: cfg0.pollIntervalSec ?? 180 };
+  const initialBatches = await Promise.all([
+    resolveInitialIdentityWithinBudget(claude.fetchClaudeSamples(initialContext), INITIAL_IDENTITY_TIMEOUT_MS),
+    resolveInitialIdentityWithinBudget(codex.fetchCodexSamples(initialContext), INITIAL_IDENTITY_TIMEOUT_MS),
+  ]);
+  for (const [provider, batch] of [['claude', initialBatches[0]], ['codex', initialBatches[1]]]) {
+    accountManager.observe(provider, batch?.identity ?? null);
+  }
+  try {
+    accountManager.finishBackfills();
+  } catch {
+    logger.warn('initial_backfill_failed');
+  }
+
   // HTTP サーバ
   server = await startServer({
     db,
+    accountManager,
     readConfig,
     appRoot,
     getAutostart: () => autostart.isEnabled(),
@@ -163,7 +185,8 @@ async function main() {
   tray = createTray({
     appRoot,
     getUrl: () => server?.url ?? '',
-    getLatest: () => (db ? db.latest() : {}),
+    getLatest: () => (db ? db.latest({ accountIdsByProvider: accountManager?.currentAccountIds?.() }) : {}),
+    getAccountDimensionAvailable: () => db?.accountDimensionAvailable !== false,
     onFetchNow: () => { void scheduler?.runNow(); },
     onQuit: () => { quitReason = 'tray-menu'; quitting = true; app.quit(); },
   });
@@ -172,7 +195,13 @@ async function main() {
   scheduler = createScheduler({
     db,
     readConfig,
-    onSamples: () => tray?.refresh(),
+    onSamples: (_samples, batches) => {
+      for (const batch of batches) {
+        accountManager?.observeBatch(batch);
+      }
+      accountManager?.finishBackfills();
+      tray?.refresh();
+    },
   });
   scheduler.start();
   tray.refresh();

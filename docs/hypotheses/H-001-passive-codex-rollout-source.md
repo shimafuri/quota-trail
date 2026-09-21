@@ -6,6 +6,7 @@ origin: true-vr-v2 の scripts/codex-limits.mjs（rollout の token_count イベ
 areas: design（データ取得）
 decisions:
   - design.md v1（2026-09-07）: 却下。3 分の能動ポーリングで足りる。v2 候補
+  - design-accounts.md v1（2026-09-22）: 却下。rollout の rate_limits と account ID の権威的な対応が確認できず、account 混在リスクが大きいため
 ---
 
 ## 仮説

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { openDb } from '../src/main/db.mjs';
 
 /** SQLite バックエンドが現在のランタイムで使えるか確かめる */
@@ -168,5 +169,124 @@ test('DB を開き直しても行が残る', { skip }, () => {
     b.close();
   } finally {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* noop */ }
+  }
+});
+
+test('v1 fixture は行を失わず冪等に v2 化される', { skip }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-trail-v1-'));
+  const file = path.join(dir, 'old.sqlite');
+  try {
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+    const raw = new DatabaseSync(file);
+    raw.exec('CREATE TABLE schema_version (version INTEGER NOT NULL); INSERT INTO schema_version VALUES (1); CREATE TABLE samples (id INTEGER PRIMARY KEY, observed_at INTEGER NOT NULL, provider TEXT NOT NULL, win TEXT NOT NULL, used_percent REAL, resets_at INTEGER, status TEXT NOT NULL, error_code TEXT, interval_sec INTEGER NOT NULL);');
+    raw.prepare('INSERT INTO samples (observed_at,provider,win,used_percent,resets_at,status,error_code,interval_sec) VALUES (?,?,?,?,?,?,?,?)').run(t0,'claude','5h',1,null,'ok',null,180);
+    raw.prepare('INSERT INTO samples (observed_at,provider,win,used_percent,resets_at,status,error_code,interval_sec) VALUES (?,?,?,?,?,?,?,?)').run(t0+1,'codex','weekly',2,null,'ok',null,180);
+    raw.close();
+    let d = openDb(file);
+    assert.equal(d.count(), 2);
+    assert.equal(d.accountDimensionAvailable, true);
+    d.close();
+    d = openDb(file);
+    assert.equal(d.count(), 2);
+    assert.equal(d.accountDimensionAvailable, true);
+    d.close();
+  } finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} }
+});
+
+test('known/unknown と範囲外境界点は account ごとに分離される', { skip }, () => {
+  withDb((db) => {
+    const a = { provider:'claude', uuid:'11111111-1111-4111-8111-111111111111', email:null, source:'test', assurance:'authoritative' };
+    const b = { provider:'claude', uuid:'22222222-2222-4222-8222-222222222222', email:null, source:'test', assurance:'authoritative' };
+    db.recordPoll([{ provider:'claude', identity:a, samples:[sample(0),sample(2)] }]);
+    db.recordPoll([{ provider:'claude', identity:b, samples:[sample(1),sample(3)] }]);
+    db.recordPoll([{ provider:'claude', identity:null, samples:[sample(1, { usedPercent:77 })] }]);
+    const aid = db.resolveAccountKey('claude', 'claude:1');
+    const rows = db.querySamples({ provider:'claude', win:'5h', accountId:aid, from:t0 + 180_000, to:t0 + 180_000 });
+    assert.deepEqual(rows.map(x => x.usedPercent), [0, 2]);
+    assert.equal(db.latest({accountIdsByProvider:{claude:null,codex:null}})['claude/5h'].usedPercent, 77);
+  });
+});
+
+test('UUID と email の衝突では UUID 用の新規行へ保存し、既存行へ誤帰属しない', { skip }, () => {
+  withDb((db) => {
+    const uuid1 = '11111111-1111-4111-8111-111111111111';
+    const uuid2 = '22222222-2222-4222-8222-222222222222';
+    const email = 'shared@example.test';
+    db.recordPoll([{ provider: 'claude', identity: { provider: 'claude', uuid: uuid1, email, source: 'test' }, samples: [sample(0)] }]);
+    db.recordPoll([{ provider: 'claude', identity: { provider: 'claude', uuid: uuid2, email, source: 'test' }, samples: [sample(1)] }]);
+    const first = db.resolveAccountKey('claude', 'claude:1');
+    const second = db.resolveAccountKey('claude', 'claude:2');
+    assert.notEqual(first, second);
+    assert.deepEqual(db.querySamples({ provider: 'claude', win: '5h', accountId: first, from: t0 - 1, to: t0 + 2 * 180_000 }).map((row) => row.usedPercent), [0]);
+    assert.deepEqual(db.querySamples({ provider: 'claude', win: '5h', accountId: second, from: t0 - 1, to: t0 + 2 * 180_000 }).map((row) => row.usedPercent), [1]);
+  });
+});
+
+test('targeted の commit 後に更新が失敗しても、再開時は固定済み target を使う', { skip }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-trail-targeted-'));
+  const file = path.join(dir, 'targeted.sqlite');
+  const uuidA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const uuidB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  try {
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+    const raw = new DatabaseSync(file);
+    raw.exec('CREATE TABLE schema_version (version INTEGER NOT NULL); INSERT INTO schema_version VALUES (1); CREATE TABLE samples (id INTEGER PRIMARY KEY, observed_at INTEGER NOT NULL, provider TEXT NOT NULL, win TEXT NOT NULL, used_percent REAL, resets_at INTEGER, status TEXT NOT NULL, error_code TEXT, interval_sec INTEGER NOT NULL);');
+    raw.prepare('INSERT INTO samples (observed_at,provider,win,used_percent,resets_at,status,error_code,interval_sec) VALUES (?,?,?,?,?,?,?,?)').run(t0, 'claude', '5h', 1, null, 'ok', null, 180);
+    raw.close();
+    const db = openDb(file);
+    const raw2 = new DatabaseSync(file);
+    raw2.exec("CREATE TRIGGER stop_backfill BEFORE UPDATE OF account_id ON samples BEGIN SELECT RAISE(ABORT, 'stop'); END;");
+    raw2.close();
+    assert.throws(() => db.finishV2Backfill('claude', { provider: 'claude', uuid: uuidA, email: null, source: 'test' }));
+    db.close();
+    const raw3 = new DatabaseSync(file);
+    const targeted = raw3.prepare("SELECT state, target_account_id FROM account_backfill_v2 WHERE provider = 'claude'").get();
+    assert.equal(targeted.state, 'targeted');
+    raw3.exec('DROP TRIGGER stop_backfill;');
+    raw3.close();
+    const resumed = openDb(file);
+    resumed.finishV2Backfill('claude', { provider: 'claude', uuid: uuidB, email: null, source: 'test' });
+    const accountA = resumed.resolveAccountKey('claude', 'claude:1');
+    const accountB = resumed.resolveAccountKey('claude', 'claude:2');
+    assert.equal(accountB, 'invalid');
+    assert.equal(resumed.querySamples({ provider: 'claude', win: '5h', accountId: accountA, from: t0 - 1, to: t0 + 1 }).length, 1);
+    resumed.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('version 2 でも accounts table が無ければ migration を再実行する', { skip }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-trail-incomplete-v2-'));
+  const file = path.join(dir, 'incomplete.sqlite');
+  try {
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+    const raw = new DatabaseSync(file);
+    raw.exec('CREATE TABLE schema_version (version INTEGER NOT NULL); INSERT INTO schema_version VALUES (2); CREATE TABLE samples (id INTEGER PRIMARY KEY, observed_at INTEGER NOT NULL, provider TEXT NOT NULL, win TEXT NOT NULL, used_percent REAL, resets_at INTEGER, status TEXT NOT NULL, error_code TEXT, interval_sec INTEGER NOT NULL, account_id INTEGER);');
+    raw.close();
+    const db = openDb(file);
+    assert.equal(db.accountDimensionAvailable, true);
+    assert.deepEqual(db.listAccounts(), []);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v1 縮退モードでも範囲外の直前と直後を返す', { skip }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-trail-v1-fallback-'));
+  const file = path.join(dir, 'fallback.sqlite');
+  try {
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+    const raw = new DatabaseSync(file);
+    raw.exec('CREATE TABLE schema_version (version INTEGER NOT NULL); INSERT INTO schema_version VALUES (1); CREATE TABLE samples (id INTEGER PRIMARY KEY, observed_at INTEGER NOT NULL, provider TEXT NOT NULL, win TEXT NOT NULL, used_percent REAL, resets_at INTEGER, status TEXT NOT NULL, error_code TEXT, interval_sec INTEGER NOT NULL); CREATE VIEW accounts AS SELECT 1 AS id;');
+    for (const i of [0, 1, 2]) raw.prepare('INSERT INTO samples (observed_at,provider,win,used_percent,resets_at,status,error_code,interval_sec) VALUES (?,?,?,?,?,?,?,?)').run(t0 + i * 180_000, 'claude', '5h', i, null, 'ok', null, 180);
+    raw.close();
+    const db = openDb(file);
+    assert.equal(db.accountDimensionAvailable, false);
+    assert.deepEqual(db.querySamples({ provider: 'claude', win: '5h', from: t0 + 180_000, to: t0 + 180_000 }).map((row) => row.usedPercent), [0, 1, 2]);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

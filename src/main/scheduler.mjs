@@ -41,16 +41,26 @@ export function createScheduler({ db, readConfig, onSamples }) {
       ]);
       const claude = claudeR.status === 'fulfilled'
         ? claudeR.value
-        : errorSamples('claude', { observedAt, intervalSec, errorCode: 'network' });
+        : {
+          provider: 'claude',
+          samples: errorSamples('claude', { observedAt, intervalSec, errorCode: 'network' }),
+          identity: null,
+        };
       const codex = codexR.status === 'fulfilled'
         ? codexR.value
-        : errorSamples('codex', { observedAt, intervalSec, errorCode: 'network' });
-      const samples = [...claude, ...codex];
+        : {
+          provider: 'codex',
+          samples: errorSamples('codex', { observedAt, intervalSec, errorCode: 'network' }),
+          identity: null,
+        };
+      const batches = [claude, codex];
+      const samples = batches.flatMap((b) => b.samples);
 
       if (samples.some((s) => s.errorCode === 'http_429')) doubleNextInterval = true;
 
       try {
-        db.insertSamples(samples);
+        if (typeof db.recordPoll === 'function') db.recordPoll(batches);
+        else db.insertSamples(samples);
       } catch (e) {
         logger.error('サンプルの保存に失敗', { error: String(e && e.message ? e.message : e) });
       }
@@ -60,7 +70,7 @@ export function createScheduler({ db, readConfig, onSamples }) {
         intervalSec,
         results: samples.map((s) => `${s.provider}/${s.window}=${s.status === 'ok' ? `${s.usedPercent}%` : s.errorCode}`).join(' '),
       });
-      try { onSamples?.(samples); } catch { /* noop */ }
+      try { onSamples?.(samples, batches); } catch { /* noop */ }
       return samples;
     } finally {
       inFlight = false;

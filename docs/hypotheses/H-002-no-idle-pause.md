@@ -6,6 +6,7 @@ origin: GPT-6 Astra との会話（2026-09-06、tmp/ディレクトリ名提案�
 areas: design（スケジューラ）
 decisions:
   - design.md v1（2026-09-07）: 採用（§4.5、§1 非目的）
+  - design-accounts.md v1（2026-09-22）: 採用。idle / ロック中に停止すると選択 account の履歴に欠測が増えるため
 ---
 
 ## 仮説

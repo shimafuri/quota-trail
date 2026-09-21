@@ -5,7 +5,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const MAX_BYTES = 1024 * 1024;
-const SECRET_KEYS = /^(authorization|cookie|token|access_token|accessToken|refresh_token|refreshToken|apiKey|api_key|headers|credentials)$/i;
+const SECRET_KEYS = /^(authorization|cookie|token|access_token|accessToken|refresh_token|refreshToken|apiKey|api_key|headers|credentials|account_id|accountId|account_uuid|accountUuid|email|emailAddress|id_token|sub|profile)$/i;
+const PRIVATE_TEXT = /Bearer\s+[^\s"']+|\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b|\b[^\s@]+@[^\s@]+\.[^\s@]+\b/ig;
 
 /** @type {{ file: string|null, dir: string|null }} */
 const state = { file: null, dir: null };
@@ -27,16 +28,18 @@ export function initLogger(logDir) {
 
 /** 秘匿キーを落とした浅いコピー */
 function sanitize(obj) {
+  if (typeof obj === 'string') return obj.replace(PRIVATE_TEXT, '[REDACTED]');
   if (!obj || typeof obj !== 'object') return obj;
   if (Array.isArray(obj)) return obj.map(sanitize);
   /** @type {Record<string, unknown>} */
   const out = {};
   for (const [k, v] of Object.entries(obj)) {
     if (SECRET_KEYS.test(k)) continue;
-    out[k] = v && typeof v === 'object' ? sanitize(v) : v;
+    out[k] = sanitize(v);
   }
   return out;
 }
+export const sanitizeForLog = sanitize;
 
 function rotateIfNeeded() {
   if (!state.file) return;

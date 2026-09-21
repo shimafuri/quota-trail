@@ -48,7 +48,7 @@ export function buildTooltip(latest) {
  * @param {() => void} deps.onFetchNow
  * @param {() => void} deps.onQuit
  */
-export function createTray({ appRoot, getUrl, getLatest, onFetchNow, onQuit }) {
+export function createTray({ appRoot, getUrl, getLatest, getAccountDimensionAvailable = () => true, onFetchNow, onQuit }) {
   const icoPath = path.join(appRoot, 'assets', 'icon.ico');
   const pngPath = path.join(appRoot, 'assets', 'icon.png');
   let image = nativeImage.createFromPath(icoPath);
@@ -90,7 +90,11 @@ export function createTray({ appRoot, getUrl, getLatest, onFetchNow, onQuit }) {
     tray,
     refresh() {
       try {
-        tray.setToolTip(buildTooltip(getLatest()));
+        let tooltip = buildTooltip(getLatest());
+        if (!getAccountDimensionAvailable()) {
+          tooltip += '\nアカウント別表示は無効';
+        }
+        tray.setToolTip(tooltip);
       } catch (e) {
         logger.warn('ツールチップ更新に失敗', { error: String(e && e.message ? e.message : e) });
       }
