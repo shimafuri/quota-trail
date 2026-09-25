@@ -14,9 +14,9 @@
 - Claude の weekly usage limit の使用率が 80% 以上であることを確認した場合、または発注者から 80% 以上であると申告された場合は、直ちにエマージェンシーモードへ移行すること
 - エマージェンシーモード中は、このセクションを上記の通常時のモデルルーティングより優先すること。Claude の Agent ツールによる `opus` / `sonnet` / `haiku` サブエージェントへの委譲は原則として行わず、Claude はタスクの分解、Codex CLI への指示、成果物のレビューと統合に専念すること
 - システム設計、技術選定、高リスクな変更、最終レビューは、Codex CLI 経由で `gpt-6-sol`（reasoning effort: high）に委譲すること
-- 通常の実装、テスト、リファクタリング、設計に基づく複数ファイルの変更は、Codex CLI 経由で `gpt-5.6-terra`（reasoning effort: medium または high）に委譲すること
-- ファイル探索、コード検索、ログの要約、定型的な調査、ドキュメント作成、小さく低リスクな修正は、Codex CLI 経由で `gpt-5.6-luna`（reasoning effort: low または medium）に委譲すること
-- Codex CLI へ委譲する際は、目的、対象範囲、制約、受け入れ条件、必要な検証をプロンプトに含めること。設計から実装まで連続するタスクでは、先に `gpt-6-sol` の設計を確定し、その設計を入力として `gpt-5.6-terra` または `gpt-5.6-luna` に実装させること
+- 通常の実装、テスト、リファクタリング、設計に基づく複数ファイルの変更は、Codex CLI 経由で `gpt-6-sol`（reasoning effort: medium または high）に委譲すること
+- ファイル探索、コード検索、ログの要約、定型的な調査、ドキュメント作成、小さく低リスクな修正は、Codex CLI 経由で `gpt-6-luna`（reasoning effort: low または medium）に委譲すること
+- Codex CLI へ委譲する際は、目的、対象範囲、制約、受け入れ条件、必要な検証をプロンプトに含めること。設計から実装まで連続するタスクでは、先に `gpt-6-sol` の設計を確定し、その設計を入力として `gpt-6-sol` または `gpt-6-luna` に実装させること
 - **Codex CLI を呼ぶたびに、その直後に `node scripts/codex-limits.mjs` を実行し、Codex の 5h limit と Weekly limit の残量・リセット時刻を Claude Code の出力（発注者への報告文）にそのまま含めること**（発注者指示 2026-09-04）。このスクリプトは `~/.codex/sessions` の最新 rollout から `rate_limits` を読むだけで Codex を呼ばない。rollout を書かない `codex exec --ephemeral` は使わないこと
 - Claude の weekly usage limit がリセットされたこと、または使用率が 80% 未満であることを確認できるまで、エマージェンシーモードを継続すること
 
