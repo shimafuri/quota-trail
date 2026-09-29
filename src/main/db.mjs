@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS account_backfill_v2 (
 export const SERIES = [
   ['claude', '5h'],
   ['claude', 'weekly'],
+  ['claude', 'weekly-fable'],
   ['codex', '5h'],
   ['codex', 'weekly'],
 ];

@@ -136,7 +136,7 @@ function cacheProfileResult(fingerprint, identity, previous, currentTime) {
 }
 
 /**
- * Claude の使用率を取得して Sample[]（5h / weekly の 2 行）を返す。
+ * Claude の使用率を取得して Sample[]（5h / weekly / weekly-fable の 3 行）を返す。
  * 例外は投げない。
  * @param {{observedAt:number, intervalSec:number}} ctx
  * @returns {Promise<{provider:string, samples:import('../lib/normalize.mjs').Sample[], identity:any}>}

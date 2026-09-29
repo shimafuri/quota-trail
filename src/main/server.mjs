@@ -163,7 +163,7 @@ export async function startServer({ db, readConfig, appRoot, onPort, getAutostar
       try { autostart = getAutostart ? getAutostart() === true : false; } catch { autostart = false; }
       sendJson(res, 200, {
         providers: ['claude', 'codex'],
-        windows: ['5h', 'weekly'],
+        windows: ['5h', 'weekly', 'weekly-fable'],
         pollIntervalSec: cfg.pollIntervalSec,
         now: Date.now(),
         dbPath: db.dbPath,

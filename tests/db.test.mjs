@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { openDb } from '../src/main/db.mjs';
+import { normalizeClaude } from '../src/main/lib/normalize.mjs';
 
 /** SQLite バックエンドが現在のランタイムで使えるか確かめる */
 function probeBackend() {
@@ -128,11 +129,11 @@ test('系列は provider / window で分かれる', { skip }, () => {
   });
 });
 
-test('queryAllSeries は 4 系列すべてのキーを返す', { skip }, () => {
+test('queryAllSeries は 5 系列すべてのキーを返す', { skip }, () => {
   withDb((db) => {
     db.insertSamples([sample(0)]);
     const all = db.queryAllSeries({ from: t0 - 1, to: t0 + 1 });
-    assert.deepEqual(Object.keys(all), ['claude/5h', 'claude/weekly', 'codex/5h', 'codex/weekly']);
+    assert.deepEqual(Object.keys(all), ['claude/5h', 'claude/weekly', 'claude/weekly-fable', 'codex/5h', 'codex/weekly']);
     assert.equal(all['claude/5h'].length, 1);
     assert.equal(all['codex/weekly'].length, 0);
   });
@@ -144,7 +145,44 @@ test('latest は各系列の最新 1 行（無ければ null）', { skip }, () =
     const latest = db.latest();
     assert.equal(latest['claude/5h'].usedPercent, 2);
     assert.equal(latest['claude/weekly'], null);
+    assert.equal(latest['claude/weekly-fable'], null);
     assert.equal(latest['codex/5h'], null);
+  });
+});
+
+test('実観測値は 5 系列として同時保存され、旧 4 系列の値を維持する', { skip }, () => {
+  withDb((db) => {
+    const claudeRows = normalizeClaude({
+      five_hour: { utilization: 40 },
+      seven_day: { utilization: 56 },
+      limits: [{ kind: 'weekly_scoped', group: 'weekly', scope: { surface: null, model: { id: null, display_name: 'Fable' } }, percent: 80, resets_at: '2026-09-30T00:00:00Z', is_active: false }],
+    }, { observedAt: t0, intervalSec: 180 });
+    db.insertSamples([
+      ...claudeRows,
+      sample(0, { provider: 'codex', usedPercent: 52 }),
+      sample(0, { provider: 'codex', window: 'weekly', usedPercent: 59 }),
+    ]);
+    const all = db.queryAllSeries({ from: t0 - 1, to: t0 + 1 });
+    assert.deepEqual(Object.keys(all), ['claude/5h', 'claude/weekly', 'claude/weekly-fable', 'codex/5h', 'codex/weekly']);
+    assert.deepEqual(Object.values(all).map((rows) => rows[0].usedPercent), [40, 56, 80, 52, 59]);
+    assert.deepEqual(Object.values(db.latest()).map((row) => row.usedPercent), [40, 56, 80, 52, 59]);
+    assert.equal(db.count(), 5);
+  });
+});
+
+test('Claude Fable 行は account ごとに分離される', { skip }, () => {
+  withDb((db) => {
+    const a = { provider: 'claude', uuid: '11111111-1111-4111-8111-111111111111', email: null, source: 'test' };
+    const b = { provider: 'claude', uuid: '22222222-2222-4222-8222-222222222222', email: null, source: 'test' };
+    db.recordPoll([{ provider: 'claude', identity: a, samples: [sample(0, { window: 'weekly-fable', usedPercent: 80 })] }]);
+    db.recordPoll([{ provider: 'claude', identity: b, samples: [sample(1, { window: 'weekly-fable', usedPercent: 20 })] }]);
+    const accountA = db.resolveAccountKey('claude', 'claude:1');
+    const accountB = db.resolveAccountKey('claude', 'claude:2');
+    const ids = { codex: null, claude: accountA };
+    assert.equal(db.latest({ accountIdsByProvider: ids })['claude/weekly-fable'].usedPercent, 80);
+    ids.claude = accountB;
+    assert.equal(db.latest({ accountIdsByProvider: ids })['claude/weekly-fable'].usedPercent, 20);
+    assert.deepEqual(db.queryAllSeries({ from: t0 - 1, to: t0 + 180_001, accountIdsByProvider: ids })['claude/weekly-fable'].map((row) => row.usedPercent), [20]);
   });
 });
 

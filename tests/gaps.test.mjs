@@ -208,3 +208,14 @@ test('factor を変えると閾値が変わる', () => {
     [],
   );
 });
+
+test('Fable の ok → window_absent → ok は欠測帯を残す', () => {
+  const samples = [
+    ok(0, { window: 'weekly-fable', usedPercent: 80 }),
+    err(3, { window: 'weekly-fable', errorCode: 'window_absent' }),
+    ok(6, { window: 'weekly-fable', usedPercent: 81 }),
+  ];
+  assert.deepEqual(computeGaps(samples, { from: T0, to: T0 + 6 * MIN, now: T0 + 6 * MIN }), [
+    { from: T0, to: T0 + 6 * MIN },
+  ]);
+});

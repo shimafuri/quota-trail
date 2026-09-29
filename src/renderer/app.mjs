@@ -1281,6 +1281,7 @@ function attachInteractions(panel) {
 function nextResetAtFor(key) {
   const latest = state.latest[key];
   if (latest?.status === 'ok' && Number.isFinite(latest.resetsAt)) return latest.resetsAt;
+  if (key === 'claude/weekly-fable' && latest?.status === 'error') return null;
   for (const sample of [...(state.data[key] ?? [])].reverse()) {
     if (sample.status === 'ok' && Number.isFinite(sample.resetsAt)) return sample.resetsAt;
   }

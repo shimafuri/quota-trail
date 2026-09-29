@@ -5,7 +5,7 @@
 
 ## 1. 目的と非目的
 
-Claude Code と Codex CLI の **5h limit / Weekly limit の使用率（%）を 3 分ごとに記録**し、履歴を **読めるグラフ**（凡例・軸ラベル・データ点・欠測の明示）で見せる Windows 常駐アプリ。Agents Pulse の不満点（色に意味がない、凡例がない、軸ラベル崩壊、データ点不明）を解消する。
+Claude Code と Codex CLI の **5h limit / Weekly limit、および Claude Fable 専用 Weekly limit の使用率（%）を 3 分ごとに記録**し、履歴を **読めるグラフ**（凡例・軸ラベル・データ点・欠測の明示）で見せる Windows 常駐アプリ。Agents Pulse の不満点（色に意味がない、凡例がない、軸ラベル崩壊、データ点不明）を解消する。
 
 非目的（v1）:
 - 消費レート（pp/h）や ETA の推定、通知、CSV 出力
@@ -51,7 +51,7 @@ quota-trail/
       gaps.mjs               欠測区間の算出（純粋関数。renderer と node:test 両方から import）
       ticks.mjs              時間軸目盛りの間隔決定（純粋関数。同上）
     renderer/
-      index.html             ダッシュボード（2x2 グリッド）
+      index.html             ダッシュボード（2 列グリッド）
       app.mjs                データ取得・状態（期間/形式/点表示、ズーム連動）
       chart.mjs              Canvas 描画（軸・目盛り・系列・点・欠測帯・凡例）
       theme.mjs              色定義
@@ -70,9 +70,9 @@ quota-trail/
 
 ```ts
 type Provider = 'claude' | 'codex';
-type Window = '5h' | 'weekly';
+type Window = '5h' | 'weekly' | 'weekly-fable';
 interface Sample {
-  observedAt: number;        // epoch ms（取得を開始した時刻。4 行とも同じ値）
+  observedAt: number;        // epoch ms（取得を開始した時刻。通常 5 行とも同じ値）
   provider: Provider;
   window: Window;
   usedPercent: number | null; // 0..100「使った割合」。取得失敗時 null
@@ -91,7 +91,7 @@ interface Sample {
 - 要求: `GET https://api.anthropic.com/api/oauth/usage`
   - `Authorization: Bearer <token>`、`anthropic-beta: oauth-2025-04-20`、`User-Agent: claude-code/<version>`（`claude --version` の結果を起動時に 1 回取得してキャッシュ、取れなければ `claude-code/2.1.263`）、`Accept: application/json`
   - タイムアウト 15 秒（`AbortController`）
-- 応答: `five_hour.utilization`（%）/ `five_hour.resets_at`（ISO）/ `seven_day.utilization` / `seven_day.resets_at` → `5h` / `weekly` の 2 行
+- 応答: `five_hour.utilization`（%）/ `five_hour.resets_at`（ISO）/ `seven_day.utilization` / `seven_day.resets_at` → `5h` / `weekly`。`limits` 内の Fable 専用週次枠 → `weekly-fable`。通常 3 行（§14）
 - 401 → `auth_expired`。`expiresAt` が過去でもまず送ってみる（サーバー判断に任せる）
 
 ### 4.3 トークン refresh 方針（重要）
@@ -112,7 +112,7 @@ interface Sample {
 ### 4.5 スケジューラ
 
 - `scheduler.mjs`: `setTimeout` の再帰。各 tick で `config.pollIntervalSec` を読み直すので設定変更が次回から効く。既定 180 秒。最小 30 秒
-- tick: `observedAt = Date.now()` を決め、Claude と Codex を **並行** に取得（`Promise.allSettled`）。結果 4 行を 1 トランザクションで insert
+- tick: `observedAt = Date.now()` を決め、Claude と Codex を **並行** に取得（`Promise.allSettled`）。結果 5 行を 1 トランザクションで insert
 - 起動直後に 1 回即時実行。トレイ「今すぐ取得」でも実行（進行中なら無視。single-flight）
 - 取得失敗時も **間隔は変えない**（バックオフ無し）。欠測を作らないため。ただし HTTP 429 のときだけ次回まで 2 倍間隔にする（その tick は `error/http_429` 行を書く）
 - PC スリープ復帰・ロック解除（`powerMonitor` の `resume` / `unlock-screen`）では `runNow()` を呼び、次のサンプルを即時取得する（欠測期間を短縮。single-flight のため実行中なら無視）。それでも `setTimeout` の予定発火時刻より 2 倍以上遅れて発火した場合は `tick が遅延`（warn、遅延秒数つき）をログに残す
@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS samples (
   id INTEGER PRIMARY KEY,
   observed_at INTEGER NOT NULL,      -- epoch ms
   provider TEXT NOT NULL,            -- 'claude' | 'codex'
-  win TEXT NOT NULL,                 -- '5h' | 'weekly'
+  win TEXT NOT NULL,                 -- '5h' | 'weekly' | 'weekly-fable'（値制約なし）
   used_percent REAL,                 -- NULL when status='error'
   resets_at INTEGER,                 -- epoch ms
   status TEXT NOT NULL,              -- 'ok' | 'error'
@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS samples (
 CREATE INDEX IF NOT EXISTS idx_samples_series_time ON samples (provider, win, observed_at);
 ```
 
-- 保持期間: v1 は削除しない（3 分 × 4 行 = 1 日 1,920 行、1 年で 70 万行程度。問題なし）。`config.retentionDays`（既定 null = 無制限）だけ用意し、値があれば起動時に古い行を削除
+- 保持期間: v1 は削除しない（3 分 × 5 行 = 1 日 2,400 行、1 年で約 87.6 万行。問題なし）。`config.retentionDays`（既定 null = 無制限）だけ用意し、値があれば起動時に古い行を削除
 - `db.mjs` API: `openDb(path)`, `insertSamples(samples[])`, `querySamples({provider, win, from, to})`（`observed_at` 昇順、範囲外の直前 1 点・直後 1 点を含む）, `latest()`（各系列の最新 1 行）
 
 ## 6. ダッシュボード配信
@@ -146,9 +146,9 @@ CREATE INDEX IF NOT EXISTS idx_samples_series_time ON samples (provider, win, ob
 - `server.mjs`: `127.0.0.1` にのみ bind。ポートは `config.port`（既定 **47811**）を試し、`EADDRINUSE` なら 47811..47899 を順に探し、それも駄目なら `listen(0)` の動的ポート。決まったポートは `config.json` に書き戻す（次回同じ URL になるよう）。トレイ「ダッシュボードを開く」は `shell.openExternal('http://127.0.0.1:<port>/')`
 - 静的: `src/renderer/*` と `src/shared/*`（`/shared/` 配下）を配信。`Content-Type` は拡張子で（`.mjs` → `text/javascript`）。`Cache-Control: no-store`。パストラバーサル禁止
 - API（JSON。CORS ヘッダは付けない）:
-  - `GET /api/meta` → `{ providers:['claude','codex'], windows:['5h','weekly'], pollIntervalSec, now, dbPath, backend, autostart }`。`autostart` は `autostart.isEnabled()` の値（読み取り専用。変更はトレイメニューのみ）
-  - `GET /api/samples?from=<ms>&to=<ms>` → `{ series: { "claude/5h": Sample[], "claude/weekly": [...], "codex/5h": [...], "codex/weekly": [...] }, now }`。`from`/`to` 必須。1 系列あたり上限 50,000 行（超えたら等間隔に間引き、`decimated:true`）
-  - `GET /api/latest` → 4 系列の最新 1 行（トレイのツールチップにも同じ関数を使う）
+  - `GET /api/meta` → `{ providers:['claude','codex'], windows:['5h','weekly','weekly-fable'], pollIntervalSec, now, dbPath, backend, autostart }`。`weekly-fable` は Claude 専用。`autostart` は `autostart.isEnabled()` の値（読み取り専用。変更はトレイメニューのみ）
+  - `GET /api/samples?from=<ms>&to=<ms>` → `{ series: { "claude/5h": Sample[], "claude/weekly": [...], "claude/weekly-fable": [...], "codex/5h": [...], "codex/weekly": [...] }, now }`。`from`/`to` 必須。1 系列あたり上限 50,000 行（超えたら等間隔に間引き、`decimated:true`）
+  - `GET /api/latest` → 5 系列の最新 1 行（トレイのツールチップは現行 2 値表示）
 - セキュリティ: localhost 限定・読み取り専用・トークン等は一切返さない
 
 ## 7. ダッシュボード UI
@@ -157,13 +157,13 @@ CREATE INDEX IF NOT EXISTS idx_samples_series_time ON samples (provider, win, ob
 
 - 幅 320〜1920 dp。`grid-template-columns: repeat(auto-fit, minmax(300px, 1fr))` で 2 列（>= 660px）/ 1 列（< 660px）。各チャートは固定高 280px（幅 < 480px では 240px）
 - 各パネル: ヘッダ左に **タイトル**（`Claude Code · 5h limit` など、系列色の丸付き）、右に 3 つの `<select>`（集計期間 / グラフ形式 / プロットの表示）。狭幅では select が折り返す
-- ページ上部: 「quota-trail」タイトル、最終取得時刻、現在値 4 つの小さな数値（例 `Claude 5h 40%`）。下部: 取得間隔と DB パスの表示
+- ページ上部: 「quota-trail」タイトル、最終取得時刻、現在値 5 つの小さな数値（例 `Claude 5h 40%`）。下部: 取得間隔と DB パスの表示
 
 ### 7.2 コントロール（各パネル右上、`<select>`）
 
 | コントロール | 選択肢 | 既定 | 連動 |
 |---|---|---|---|
-| 集計期間 | 24時間 / 7日間 / 30日間 / カスタム | 24時間 | **全パネル連動**（1 つ変えると 4 つ同じ範囲になる） |
+| 集計期間 | 24時間 / 7日間 / 30日間 / カスタム | 24時間 | **全パネル連動**（1 つ変えると 5 つ同じ範囲になる） |
 | グラフ形式 | 折れ線 / 棒グラフ | 折れ線 | パネル個別 |
 | プロットの表示 | あり / なし | あり | パネル個別 |
 
@@ -175,7 +175,7 @@ CREATE INDEX IF NOT EXISTS idx_samples_series_time ON samples (provider, win, ob
 
 - `wheel` イベント（`passive:false`、`preventDefault`）。前へ転がす（`deltaY < 0`）→ ズームイン、後ろ → ズームアウト。1 ノッチで範囲を ×0.8 / ×1.25。マウス X 位置を固定点にする（カーソル下の時刻が動かない）
 - 最小範囲 1 分（技術的下限）。最大範囲・未来側の上限なし（発注者指示 2026-09-08）。`now` が表示範囲内にあるときは灰色の細い破線と「現在」ラベルを描く
-- ズームすると集計期間 select を **「カスタム」** に切り替え、4 パネル全部の範囲を同じにする（連動）。API 再取得はデバウンス 150ms、描画は即時（手元のデータで）
+- ズームすると集計期間 select を **「カスタム」** に切り替え、5 パネル全部の範囲を同じにする（連動）。API 再取得はデバウンス 150ms、描画は即時（手元のデータで）
 - ドラッグでのパンは任意（実装コストが低ければ入れる）
 
 ### 7.4 描画（`chart.mjs`、Canvas 2D、devicePixelRatio 対応）
@@ -202,6 +202,7 @@ CREATE INDEX IF NOT EXISTS idx_samples_series_time ON samples (provider, win, ob
 |---|---|---|
 | Claude Code 5h | `#D97757` | Anthropic/Claude ブランドのテラコッタ |
 | Claude Code Weekly | `#B4532F` | 同系の濃色（区別と「薄くしない」ため） |
+| Claude Code Weekly Fable | `#8E3B63` | テラコッタと区別できる濃いプラム色 |
 | Codex 5h | `#10A37F` | ChatGPT/OpenAI の緑 |
 | Codex Weekly | `#0B7A5E` | 同系の濃色 |
 | 欠測 | `rgba(120,120,128,0.18)` 帯 + `#8E8E93` 上端バー | |
@@ -210,7 +211,7 @@ CREATE INDEX IF NOT EXISTS idx_samples_series_time ON samples (provider, win, ob
 
 ## 8. トレイ
 
-- アイコン: `assets/icon.ico`（16/32）。ツールチップ: `quota-trail\nClaude 5h 40% / W 36%\nCodex 5h 52% / W 59%\n最終取得 03:24`（error 時はその系列を `--` と短い理由）
+- アイコン: `assets/icon.ico`（16/32）。ツールチップ: `quota-trail\nClaude 5h 40% / W 36%\nCodex 5h 52% / W 59%\n最終取得 03:24`（error 時はその系列を `--` と短い理由）。トレイは現行の各プロバイダー 2 値表示を維持し、Fable は追加しない
 - 右クリックメニュー:
   1. `ダッシュボードを開く`（左クリックでも同じ）
   2. `今すぐ取得`
@@ -239,19 +240,19 @@ CREATE INDEX IF NOT EXISTS idx_samples_series_time ON samples (provider, win, ob
 
 ## 11. テスト（`node:test`）
 
-- `normalize.test.mjs`: Claude 応答 / Codex HTTP 応答 / Codex app-server 応答の正規化。`secondary_window` 無し、clamp、ISO と epoch 秒の変換
+- `normalize.test.mjs`: Claude 応答（Fable を含む）/ Codex HTTP 応答 / Codex app-server 応答の正規化。`secondary_window` 無し、clamp、ISO と epoch 秒の変換
 - `gaps.test.mjs`: 閾値超の間隔、error 連続、先頭・末尾、`intervalSec` が途中で変わるケース
 - `resets.test.mjs`: 未使用ウィンドウの `resetsAt` スライド（誤検出しない）、秒未満のゆらぎ、実際のリセット（`resetsAt` 固定＋使用率低下）、予告時刻未経過だが使用率低下、ウィンドウ開始直後の使用率上昇（誤検出しない）
 - `ticks.test.mjs`: 幅 300px で 24h → 6h ステップ、幅 1800px で 24h → 1h（>= 50px を満たす最小）、30d → 2d 等。目盛りのアライメント
 - `ports.test.mjs`: 使用中ポートを避けること
-- `db.test.mjs`: 一時ファイルで insert → query の往復、範囲外前後 1 点の包含
+- `db.test.mjs`: 一時ファイルで insert → query の往復、範囲外前後 1 点の包含、5 系列とアカウント分離
 
 ## 12. 受け入れ条件（v1）
 
 1. `npm install && npm start` で Windows のトレイにアイコンが出る（ウィンドウは出ない）
-2. 起動直後と 3 分ごとに `samples` に 4 行（または error 行）が増える。`config.json` の `pollIntervalSec` を変えると次回から間隔が変わる
-3. 「ダッシュボードを開く」で既定ブラウザに `http://127.0.0.1:<port>/` が開き、2×2 のグラフ、Y 目盛り 10% 刻み、X 目盛りが >= 50px 間隔、凡例、データ点、欠測の灰色帯が表示される。幅 320px と 1920px でレイアウトが崩れない
-4. select で期間（連動）・形式・点表示を切り替えられ、ホイールでズームすると期間が「カスタム」になり 4 グラフが連動する
+2. 起動直後と 3 分ごとに `samples` に 5 行（または error 行）が増える。`config.json` の `pollIntervalSec` を変えると次回から間隔が変わる
+3. 「ダッシュボードを開く」で既定ブラウザに `http://127.0.0.1:<port>/` が開き、5 つのグラフ、Y 目盛り 10% 刻み、X 目盛りが >= 50px 間隔、凡例、データ点、欠測の灰色帯が表示される。幅 320px と 1920px でレイアウトが崩れない
+4. select で期間（連動）・形式・点表示を切り替えられ、ホイールでズームすると期間が「カスタム」になり 5 グラフが連動する
 5. 「Windows 起動時に実行する」をチェックすると `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` に登録され、外すと消える
 6. `node --test` が通る
 7. 認証切れ・ネットワーク断でもアプリは落ちず、error 行が記録され、グラフに灰色として出る
@@ -260,3 +261,44 @@ CREATE INDEX IF NOT EXISTS idx_samples_series_time ON samples (provider, win, ob
 
 - H-001（Codex rollout の `rate_limits` を副次データ源にする）: **却下（v1）**。能動ポーリングで 3 分粒度が得られるため不要。Codex 使用直後の高頻度な値が欲しくなったら v2 で再検討
 - H-002（idle / ロック中もポーリングを止めない）: **採用**。Agents Pulse の「操作なし 300 秒で停止・ロック中停止」は、CLI を回したまま離席する使い方で履歴に穴を空ける。quota-trail は API を呼ぶだけで枠を消費しないので常時取得する
+
+## 14. Claude Fable 週次リミット（2026-09-27 追加）
+
+### 14.1 系列と取得規則
+
+`claude/weekly-fable` を Claude 専用の 3 番目の系列とする。`Sample.window` に `weekly-fable` を加え、通常の tick は Claude 3 行、Codex 2 行を同じ `observedAt` で記録する。既存の `five_hour → claude/5h` と `seven_day → claude/weekly` は維持する。
+
+`limits` が配列なら、`kind === 'weekly_scoped'`、`group === 'weekly'`、`scope.surface == null`、`scope.model.display_name` の前後空白を除いた小文字が `fable` と完全一致する行だけを候補とする。`scope.model.id`、`severity`、配列順序は選択に使わない。候補 1 行なら `is_active:false` でも採用する。複数なら `is_active === true` がちょうど 1 行のときのみ採用し、他は `parse` error とする。
+
+採用行の `percent` は `clampPercent`、`resets_at` は `isoToMs` で変換する。数値化できない `percent` は `parse` error、無効な `resets_at` は `resetsAt:null` の `ok` とする。`limits` が無い、null、空配列、候補無しなら Fable の `window_absent` error を 1 行記録し、非配列なら Fable の `parse` error を記録する。読めている既存 2 行は `ok` のまま。応答全体が不正なら Claude 3 行とも `parse` とする。
+
+`errorSamples` と `allSeriesKeys` はプロバイダー別窓一覧から生成する。Claude は `5h`, `weekly`, `weekly-fable`、Codex は `5h`, `weekly` の順。認証、通信、タイムアウトの失敗時も Claude は 3 error 行、Codex は 2 error 行を作る。対象モデルは Fable 固定とし、未知のモデルから系列を自動生成しない。
+
+### 14.2 永続化と API
+
+`samples.win` は `TEXT NOT NULL` で値制約がない。既存の `(provider, win, observed_at)` と v2 の `(provider, account_id, win, observed_at, id)` のインデックスを使う。スキーマ、`schema_version`、既存行は変更しない。DB の `SERIES` に `['claude','weekly-fable']` を Claude weekly の直後へ追加し、`queryAllSeries()` と `latest()` は 5 キーを返す。
+
+Fable 行は同じ Claude 取得結果と identity で `recordPoll()` に渡し、既存の `account_id` を付ける。v2 の旧行 backfill は移行時点で固定した sample ID 上限までなので、新行を旧アカウントへ遡及帰属しない。実装前の Fable 履歴も生成しない。`/api/samples` と `/api/latest` に Fable キーを加える。`/api/meta.windows` に `weekly-fable` を加えるが、Claude 専用である。アカウント選択キーは従来どおりプロバイダー単位の `claude` とする。
+
+### 14.3 ダッシュボード
+
+Claude Code グループは 5h、Weekly、Weekly Fable の順。既存の 2 列グリッドでは Fable は 2 行目の左側。Codex の 2 パネルはそのままとする。Fable の色は `#8E3B63`、タイトルは `Claude Code · Weekly Fable limit`、凡例は `Claude Code Weekly Fable limit 使用率`、上部の現在値名は `Claude Fable W`。
+
+`SERIES_KEYS` に新キーを Claude weekly の直後に追加し、既存の期間変更、ズーム、形式、点表示、パネル設定、Claude アカウント切替と再取得に参加させる。旧 `localStorage` に新キーが無ければ折れ線・点ありで開始し、既存 4 パネルの設定を保持する。Fable の最新行が error のときは現在値を `--` とし、過去の `ok` 行からリセット予定時刻を復活表示しない。この判定は Fable に限る。`chart.mjs` の描画 API と凡例、トレイ表示は変更しない。
+
+### 14.4 欠測・リセット・時間軸
+
+Fable の `window_absent` を含む error 行は `computeGaps()` による灰色の欠測区間となる。記録開始前から最初の点までも既存規則で欠測とし、消えて再出現した間を線で結ばない。Fable の `resets_at` は独立した週次枠の予定時刻として使う。過去のリセットは `pastResets()`、予定マーカーは既存のチャート描画で扱う。`pastResets()` は error を除く `ok` 点を比較するため、欠測をまたいで予告時刻が経過した場合も検出し得るが、欠測帯は残す。`ticks.mjs` は変更しない。
+
+### 14.5 変更ファイルと検証
+
+対象は `src/main/lib/normalize.mjs`、`src/main/providers/claude.mjs`、`src/main/db.mjs`、`src/main/server.mjs`、`src/renderer/theme.mjs`、`src/renderer/app.mjs`、および `tests/normalize.test.mjs`、`tests/db.test.mjs`、`tests/server.test.mjs`、`tests/providers-accounts.test.mjs`、`tests/gaps.test.mjs`、`tests/resets.test.mjs`。実観測形式の `seven_day=56` と Fable `percent=80` を別系列に同時保存すること、順序違い、Opus 混在、欠落、重複、不正値、Claude 3 行と Codex 2 行の error、アカウント分離、API の 5 キー、欠測とリセットを検証する。`node --test` に加え、幅 320px と 1920px、Claude アカウント切替、Fable 行が消えた回の欠測表示を画面で確認する。
+
+### 14.6 既存節との整合
+
+§1、§4.1、§4.2、§4.5、§5、§6、§7.1–7.2、§7.5、§8、§11–12 の系列数、行数、パネル数、現在値数は 5 に更新した。既定 3 分間隔では 1 日 2,400 行、1 年約 87.6 万行。トレイの文例は現行 2 値表示を維持する。
+
+### 14.7 設計仮説の判断
+
+- **H-001: 対象外。** Codex rollout の副次データ源であり、Claude OAuth usage の Fable 行には適用しない。従来の却下判断は維持する。
+- **H-002: 採用。** Fable を含む Claude 3 系列も idle・ロック中に同じ tick で記録する。停止すると Fable と all models の増加差の履歴に穴が空く。

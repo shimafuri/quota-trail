@@ -16,6 +16,7 @@ function usageResponse() {
     json: async () => ({
       five_hour: { utilization: 10, resets_at: '2026-01-01T01:00:00.000Z' },
       seven_day: { utilization: 20, resets_at: '2026-01-02T01:00:00.000Z' },
+      limits: [{ kind: 'weekly_scoped', group: 'weekly', scope: { surface: null, model: { id: null, display_name: 'Fable' } }, percent: 80, resets_at: '2026-01-03T01:00:00.000Z', is_active: false }],
     }),
     text: async () => '',
   };
@@ -47,10 +48,12 @@ test('Claude local fallback は 5 分後に再読込され、権威 cache へ昇
     };
     const first = await fetchClaudeSamples({ observedAt: currentTime, intervalSec: 180 });
     assert.equal(first.identity?.uuid, uuidA);
+    assert.deepEqual(first.samples.map((s) => [s.window, s.usedPercent]), [['5h', 10], ['weekly', 20], ['weekly-fable', 80]]);
     currentTime += 5 * 60_000 + 1;
     fs.writeFileSync(path.join(dir, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: uuidB } }));
     const second = await fetchClaudeSamples({ observedAt: currentTime, intervalSec: 180 });
     assert.equal(second.identity?.uuid, uuidB);
+    assert.equal(second.samples.length, 3);
     assert.equal(profileCalls, 2);
   } finally {
     Date.now = originalNow;
@@ -77,6 +80,7 @@ test('Claude usage の通信例外でも、同じ token の既知 identity を�
     };
     const known = await fetchClaudeSamples({ observedAt: currentTime, intervalSec: 180 });
     assert.equal(known.identity?.uuid, uuidA);
+    assert.equal(known.samples[2].usedPercent, 80);
     currentTime += 60 * 60_000 + 1;
     globalThis.fetch = async (url) => {
       if (String(url).includes('/profile')) return { ok: false, text: async () => '' };
@@ -84,6 +88,7 @@ test('Claude usage の通信例外でも、同じ token の既知 identity を�
     };
     const failed = await fetchClaudeSamples({ observedAt: currentTime, intervalSec: 180 });
     assert.equal(failed.samples[0].errorCode, 'network');
+    assert.deepEqual(failed.samples.map((s) => [s.window, s.errorCode]), [['5h', 'network'], ['weekly', 'network'], ['weekly-fable', 'network']]);
     assert.equal(failed.identity?.uuid, uuidA);
   } finally {
     Date.now = originalNow;

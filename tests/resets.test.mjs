@@ -73,3 +73,13 @@ test('ウィンドウ開始直後: アイドルのスライドから resetsAt �
   const b = ok(180 * SEC, { usedPercent: 3, resetsAt: T0 + 5 * HOUR + 10 * MIN });
   assert.deepEqual(pastResets([a, b]), []);
 });
+
+test('Fable の window_absent をまたいでも既存規則でリセットを検出する', () => {
+  const resetAt = T0 + 5 * MIN;
+  const samples = [
+    ok(0, { provider: 'claude', window: 'weekly-fable', usedPercent: 80, resetsAt: resetAt }),
+    ok(3 * MIN, { provider: 'claude', window: 'weekly-fable', status: 'error', errorCode: 'window_absent', usedPercent: null, resetsAt: null }),
+    ok(6 * MIN, { provider: 'claude', window: 'weekly-fable', usedPercent: 0, resetsAt: resetAt + 7 * 24 * HOUR }),
+  ];
+  assert.deepEqual(pastResets(samples), [resetAt]);
+});

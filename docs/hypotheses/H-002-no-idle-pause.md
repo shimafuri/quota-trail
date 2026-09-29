@@ -7,6 +7,7 @@ areas: design（スケジューラ）
 decisions:
   - design.md v1（2026-09-07）: 採用（§4.5、§1 非目的）
   - design-accounts.md v1（2026-09-22）: 採用。idle / ロック中に停止すると選択 account の履歴に欠測が増えるため
+  - design.md §14（2026-09-27）: 採用。Fable を含む Claude 3 系列も idle / ロック中に同じ tick で記録し、all models との差の履歴を維持
 ---
 
 ## 仮説

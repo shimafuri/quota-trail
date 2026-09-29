@@ -44,8 +44,8 @@ function fakeDb(over = {}) {
   return {
     dbPath: 'C:/tmp/fake.sqlite',
     backend: 'fake',
-    latest: () => ({ 'claude/5h': s, 'claude/weekly': null, 'codex/5h': null, 'codex/weekly': null }),
-    queryAllSeries: () => ({ 'claude/5h': [s], 'claude/weekly': [], 'codex/5h': [], 'codex/weekly': [] }),
+    latest: () => ({ 'claude/5h': s, 'claude/weekly': null, 'claude/weekly-fable': null, 'codex/5h': null, 'codex/weekly': null }),
+    queryAllSeries: () => ({ 'claude/5h': [s], 'claude/weekly': [], 'claude/weekly-fable': [], 'codex/5h': [], 'codex/weekly': [] }),
     accountDimensionAvailable: true,
     listAccounts: () => [{ provider:'claude', accountKey:'claude:1', label:'アカウント1' }],
     hasUnknownSamples: (provider) => provider === 'codex',
@@ -99,7 +99,7 @@ test('HTTP API: /api/meta, /api/latest, /api/samples', async (t) => {
 
   const meta = await (await fetch(`${base}/api/meta`)).json();
   assert.deepEqual(meta.providers, ['claude', 'codex']);
-  assert.deepEqual(meta.windows, ['5h', 'weekly']);
+  assert.deepEqual(meta.windows, ['5h', 'weekly', 'weekly-fable']);
   assert.equal(meta.pollIntervalSec, 180);
   assert.equal(typeof meta.now, 'number');
   assert.equal(meta.dbPath, 'C:/tmp/fake.sqlite');
@@ -123,9 +123,10 @@ test('HTTP API: /api/meta, /api/latest, /api/samples', async (t) => {
   const latest = await (await fetch(`${base}/api/latest`)).json();
   assert.equal(latest.series['claude/5h'].usedPercent, 41.5);
   assert.equal(latest.series['codex/weekly'], null);
+  assert.equal(latest.series['claude/weekly-fable'], null);
 
   const samples = await (await fetch(`${base}/api/samples?from=0&to=${Date.now()}`)).json();
-  assert.deepEqual(Object.keys(samples.series), ['claude/5h', 'claude/weekly', 'codex/5h', 'codex/weekly']);
+  assert.deepEqual(Object.keys(samples.series), ['claude/5h', 'claude/weekly', 'claude/weekly-fable', 'codex/5h', 'codex/weekly']);
   assert.equal(samples.series['claude/5h'][0].provider, 'claude');
   assert.equal(samples.decimated, undefined);
 
@@ -247,9 +248,9 @@ test('旧単件 endpoint /api/account-identifier は 404 になる', async (t) =
 test('実 ID endpoint を追加しても series shape は変わらない', async (t) => {
   const base = await withServer(t);
   const samples = await (await fetch(`${base}/api/samples?from=0&to=${Date.now()}&claude=claude:1`)).json();
-  assert.deepEqual(Object.keys(samples.series), ['claude/5h', 'claude/weekly', 'codex/5h', 'codex/weekly']);
+  assert.deepEqual(Object.keys(samples.series), ['claude/5h', 'claude/weekly', 'claude/weekly-fable', 'codex/5h', 'codex/weekly']);
   const latest = await (await fetch(`${base}/api/latest?claude=claude:1`)).json();
-  assert.deepEqual(Object.keys(latest.series), ['claude/5h', 'claude/weekly', 'codex/5h', 'codex/weekly']);
+  assert.deepEqual(Object.keys(latest.series), ['claude/5h', 'claude/weekly', 'claude/weekly-fable', 'codex/5h', 'codex/weekly']);
   const serialized = `${JSON.stringify(samples)}${JSON.stringify(latest)}`;
   assert.equal(serialized.includes(FIXTURE_EMAIL), false);
   assert.equal(serialized.includes(FIXTURE_UUID), false);

@@ -4,14 +4,14 @@
  */
 
 /**
- * @typedef {'claude/5h'|'claude/weekly'|'codex/5h'|'codex/weekly'} SeriesKey
+ * @typedef {'claude/5h'|'claude/weekly'|'claude/weekly-fable'|'codex/5h'|'codex/weekly'} SeriesKey
  */
 
 /**
  * @typedef {Object} SeriesDef
  * @property {SeriesKey} key
  * @property {'claude'|'codex'} provider
- * @property {'5h'|'weekly'} window
+ * @property {'5h'|'weekly'|'weekly-fable'} window
  * @property {string} color 系列色
  * @property {string} title パネルタイトル
  * @property {string} legend 凡例の系列名
@@ -22,6 +22,7 @@
 export const SERIES_KEYS = Object.freeze([
   'claude/5h',
   'claude/weekly',
+  'claude/weekly-fable',
   'codex/5h',
   'codex/weekly',
 ]);
@@ -45,6 +46,15 @@ export const SERIES = {
     title: 'Claude Code · Weekly limit',
     legend: 'Claude Code Weekly limit 使用率',
     short: 'Claude W',
+  },
+  'claude/weekly-fable': {
+    key: 'claude/weekly-fable',
+    provider: 'claude',
+    window: 'weekly-fable',
+    color: '#8E3B63',
+    title: 'Claude Code · Weekly Fable limit',
+    legend: 'Claude Code Weekly Fable limit 使用率',
+    short: 'Claude Fable W',
   },
   'codex/5h': {
     key: 'codex/5h',

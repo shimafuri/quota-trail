@@ -3,7 +3,7 @@
 
 /**
  * @typedef {'claude'|'codex'} Provider
- * @typedef {'5h'|'weekly'} WindowKey
+ * @typedef {'5h'|'weekly'|'weekly-fable'} WindowKey
  * @typedef {Object} Sample
  * @property {number} observedAt   epoch ms
  * @property {Provider} provider
@@ -15,10 +15,13 @@
  * @property {number} intervalSec
  */
 
-/** @type {WindowKey[]} */
-export const WINDOWS = ['5h', 'weekly'];
 /** @type {Provider[]} */
 export const PROVIDERS = ['claude', 'codex'];
+/** @type {Record<Provider, WindowKey[]>} */
+export const WINDOWS_BY_PROVIDER = {
+  claude: ['5h', 'weekly', 'weekly-fable'],
+  codex: ['5h', 'weekly'],
+};
 
 /** 系列キー（API / DB / UI 共通） */
 export function seriesKey(provider, window) {
@@ -27,7 +30,7 @@ export function seriesKey(provider, window) {
 
 /** すべての系列キーを設計書の順で返す */
 export function allSeriesKeys() {
-  return PROVIDERS.flatMap((p) => WINDOWS.map((w) => seriesKey(p, w)));
+  return PROVIDERS.flatMap((p) => WINDOWS_BY_PROVIDER[p].map((w) => seriesKey(p, w)));
 }
 
 /**
@@ -92,24 +95,25 @@ export function makeSample({ observedAt, provider, window, intervalSec, usedPerc
 }
 
 /**
- * 1 プロバイダー分の error 行（5h / weekly の 2 行）を作る。
+ * 1 プロバイダー分の error 行を作る。
  * @param {Provider} provider
  * @param {{observedAt:number, intervalSec:number, errorCode:string}} ctx
  * @returns {Sample[]}
  */
 export function errorSamples(provider, { observedAt, intervalSec, errorCode }) {
-  return WINDOWS.map((w) => makeSample({ observedAt, provider, window: w, intervalSec, errorCode }));
+  return WINDOWS_BY_PROVIDER[provider].map((w) => makeSample({ observedAt, provider, window: w, intervalSec, errorCode }));
 }
 
 /**
  * Claude `GET /api/oauth/usage` の応答を正規化。
- * five_hour.utilization / resets_at(ISO), seven_day.utilization / resets_at
+ * five_hour.utilization / resets_at(ISO), seven_day.utilization / resets_at,
+ * limits 内の Fable weekly_scoped 行
  * @param {any} json
  * @param {{observedAt:number, intervalSec:number}} ctx
  * @returns {Sample[]}
  */
 export function normalizeClaude(json, { observedAt, intervalSec }) {
-  if (!json || typeof json !== 'object') {
+  if (!json || typeof json !== 'object' || Array.isArray(json)) {
     return errorSamples('claude', { observedAt, intervalSec, errorCode: 'parse' });
   }
   /** @type {Array<[WindowKey, any]>} */
@@ -117,7 +121,7 @@ export function normalizeClaude(json, { observedAt, intervalSec }) {
     ['5h', json.five_hour],
     ['weekly', json.seven_day],
   ];
-  return pairs.map(([win, w]) => {
+  const rows = pairs.map(([win, w]) => {
     if (!w || typeof w !== 'object') {
       return makeSample({ observedAt, provider: 'claude', window: win, intervalSec, errorCode: 'window_absent' });
     }
@@ -134,6 +138,33 @@ export function normalizeClaude(json, { observedAt, intervalSec }) {
       resetsAt: isoToMs(w.resets_at),
     });
   });
+  const fable = 'weekly-fable';
+  const fableError = (errorCode) => makeSample({ observedAt, provider: 'claude', window: fable, intervalSec, errorCode });
+  if (json.limits == null || (Array.isArray(json.limits) && json.limits.length === 0)) {
+    rows.push(fableError('window_absent'));
+    return rows;
+  }
+  if (!Array.isArray(json.limits)) {
+    rows.push(fableError('parse'));
+    return rows;
+  }
+  const candidates = json.limits.filter((limit) =>
+    limit?.kind === 'weekly_scoped'
+    && limit.group === 'weekly'
+    && limit.scope?.surface == null
+    && typeof limit.scope?.model?.display_name === 'string'
+    && limit.scope.model.display_name.trim().toLowerCase() === 'fable');
+  if (candidates.length === 0) {
+    rows.push(fableError('window_absent'));
+    return rows;
+  }
+  const active = candidates.filter((limit) => limit.is_active === true);
+  const selected = candidates.length === 1 ? candidates[0] : (active.length === 1 ? active[0] : null);
+  const usedPercent = selected ? clampPercent(selected.percent) : null;
+  rows.push(usedPercent === null
+    ? fableError('parse')
+    : makeSample({ observedAt, provider: 'claude', window: fable, intervalSec, usedPercent, resetsAt: isoToMs(selected.resets_at) }));
+  return rows;
 }
 
 /**
