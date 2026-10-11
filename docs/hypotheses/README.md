@@ -42,3 +42,4 @@
 |---|---|---|---|
 | [H-001](H-001-passive-codex-rollout-source.md) | Codex の rollout の rate_limits を副次データ源にする | evaluated | design（データ取得） |
 | [H-002](H-002-no-idle-pause.md) | idle / ロック中でもポーリングを止めない | adopted | design（スケジューラ） |
+| [H-003](H-003-probe-after-local-expiry.md) | ローカル期限切れ token でも token ごとに上限付きで確認送信する | evaluated | design（§15.12、2026-10-11: 部分採用） |

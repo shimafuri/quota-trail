@@ -15,6 +15,7 @@
  * - weekly 系列: 週をかけてゆっくり上昇し、週次でリセット
  * - いくつかの欠測（20〜90 分）
  * - status:'error' が連続する区間
+ * - Claude だけの認証更新待ち区間（auth_expiring → auth_expired_local、直近は期限切れのまま。設計 §15.6）
  * - intervalSec が 60 になっている区間
  *
  * 本番の main プロセスとは無関係（開発時の目視確認専用）。
@@ -24,10 +25,11 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
+const { computeAuthGaps } = await import(pathToFileURL(path.join(ROOT, 'src', 'shared', 'gaps.mjs')).href);
 const RENDERER_DIR = path.join(ROOT, 'src', 'renderer');
 const SHARED_DIR = path.join(ROOT, 'src', 'shared');
 
@@ -157,6 +159,10 @@ const ERROR_WINDOWS = [
   { at: NOW - 12.5 * DAY, minutes: 150, code: 'auth_expired' },
   { at: NOW - 30 * HOUR, minutes: 42, code: 'network' },
   { at: NOW - 15 * HOUR, minutes: 33, code: 'http_429' },
+  // Claude だけの認証更新待ち（期限間近 1 tick → ローカル期限切れ）。直近 40 分も期限切れのまま
+  { at: NOW - 6 * HOUR, minutes: 3, code: 'auth_expiring', provider: 'claude' },
+  { at: NOW - 6 * HOUR + 3 * MIN, minutes: 117, code: 'auth_expired_local', provider: 'claude' },
+  { at: NOW - 40 * MIN, minutes: 41, code: 'auth_expired_local', provider: 'claude' },
 ];
 
 /** intervalSec が 60 になっている区間 */
@@ -164,14 +170,16 @@ const DENSE_WINDOW = { from: NOW - 2.5 * DAY, to: NOW - 2.1 * DAY };
 
 /**
  * @param {number} t
+ * @param {string} provider
  * @returns {{skip:boolean, error:string|null, intervalSec:number}}
  */
-function tickShape(t) {
+function tickShape(t, provider) {
   for (const g of GAP_WINDOWS) {
     if (t >= g.at && t < g.at + g.minutes * MIN) return { skip: true, error: null, intervalSec: 180 };
   }
   let error = null;
   for (const e of ERROR_WINDOWS) {
+    if (e.provider && e.provider !== provider) continue;
     if (t >= e.at && t < e.at + e.minutes * MIN) error = e.code;
   }
   const intervalSec = t >= DENSE_WINDOW.from && t < DENSE_WINDOW.to ? 60 : 180;
@@ -186,10 +194,10 @@ for (const k of SERIES_KEYS) DB[k] = [];
   let t = RANGE_START;
   let guard = 0;
   while (t <= NOW && guard++ < 200000) {
-    const shape = tickShape(t);
-    if (!shape.skip) {
+    if (!tickShape(t, '').skip) {
       for (const key of SERIES_KEYS) {
         const [provider, win] = key.split('/');
+        const shape = tickShape(t, provider);
         if (shape.error) {
           DB[key].push({
             observedAt: t,
@@ -464,7 +472,13 @@ const server = http.createServer((req, res) => {
       series[key] = d.rows;
       decimated = decimated || d.decimated;
     }
-    sendJson(res, 200, { series, now: Date.now(), decimated });
+    // 認証区間は間引き前の生データから計算する（本番 server.mjs と同じ。設計 §15.6）
+    /** @type {Record<string, any[]>} */
+    const authGaps = {};
+    for (const key of SERIES_KEYS.filter((k) => k.startsWith('claude/'))) {
+      authGaps[key] = computeAuthGaps(rowsForAccount(sliceWithNeighbors(DB[key], from, to), accountKeys.claude), { from, to, now: Date.now() });
+    }
+    sendJson(res, 200, { series, authGaps, now: Date.now(), decimated });
     return;
   }
 

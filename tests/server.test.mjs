@@ -255,3 +255,97 @@ test('実 ID endpoint を追加しても series shape は変わらない', async
   assert.equal(serialized.includes(FIXTURE_EMAIL), false);
   assert.equal(serialized.includes(FIXTURE_UUID), false);
 });
+
+// ---------------------------------------------------------------- §15.6 認証区間 overlay
+
+/**
+ * Claude 認証 error が続く系列（偽データ）を返す DB。
+ * @param {number} count Claude 5h の行数
+ * @param {(i:number) => string|null} codeAt 各行の error code（null なら ok）
+ */
+function authDb(count, codeAt) {
+  const base = 1_757_200_000_000;
+  const row = (i, window) => {
+    const code = codeAt(i);
+    return {
+      observedAt: base + i * 180_000,
+      provider: 'claude',
+      window,
+      usedPercent: code ? null : 10,
+      resetsAt: null,
+      status: code ? 'error' : 'ok',
+      errorCode: code,
+      intervalSec: 180,
+    };
+  };
+  const calls = [];
+  return {
+    base,
+    calls,
+    db: fakeDb({
+      queryAllSeries: (args) => {
+        calls.push(args);
+        return {
+          'claude/5h': Array.from({ length: count }, (_, i) => row(i, '5h')),
+          'claude/weekly': [],
+          'claude/weekly-fable': [],
+          'codex/5h': [],
+          'codex/weekly': [],
+        };
+      },
+    }),
+  };
+}
+
+test('/api/samples は account filter 後の生データから authGaps を返し、series と既存フィールドは互換', async (t) => {
+  // 0..9 は ok、10..19 はローカル期限切れ、20..29 は 401（旧 auth_expired）、30 は 429
+  const { base, calls, db } = authDb(31, (i) => (i >= 10 && i < 20 ? 'auth_expired_local' : (i >= 20 && i < 30 ? 'auth_expired' : (i === 30 ? 'http_429' : null))));
+  const baseUrl = await withServer(t, { db });
+  const body = await (await fetch(`${baseUrl}/api/samples?from=${base}&to=${base + 31 * 180_000}&claude=claude:1`)).json();
+  assert.deepEqual(Object.keys(body.series), ['claude/5h', 'claude/weekly', 'claude/weekly-fable', 'codex/5h', 'codex/weekly']);
+  assert.deepEqual(Object.keys(body.authGaps), ['claude/5h', 'claude/weekly', 'claude/weekly-fable']);
+  assert.deepEqual(body.authGaps['claude/5h'], [
+    { from: base + 10 * 180_000, to: base + 20 * 180_000, reason: 'auth_expired_local' },
+    { from: base + 20 * 180_000, to: base + 30 * 180_000, reason: 'auth_expired' },
+  ]);
+  assert.deepEqual(body.authGaps['claude/weekly'], []);
+  assert.equal(body.decimated, undefined);
+  // account filter はクエリの段階で適用されている
+  assert.equal(calls[0].accountIdsByProvider.claude, 42);
+  const serialized = JSON.stringify(body);
+  assert.equal(serialized.includes(FIXTURE_EMAIL), false);
+  assert.equal(serialized.includes(FIXTURE_UUID), false);
+});
+
+test('/api/samples の authGaps は間引きで消えない', async (t) => {
+  // 上限 50,000 行を超える系列の中に 1 行だけ認証 error を置く。等間隔の間引きでは落ちる位置
+  const count = 50_010;
+  const indexes = Array.from({ length: count }, (_, i) => i);
+  const kept = new Set(decimate(indexes));
+  const target = indexes.find((i) => !kept.has(i) && i > 0);
+  const { base, db } = authDb(count, (i) => (i === target ? 'auth_expired_local' : null));
+  const baseUrl = await withServer(t, { db });
+  const body = await (await fetch(`${baseUrl}/api/samples?from=${base}&to=${base + count * 180_000}`)).json();
+  assert.equal(body.decimated, true);
+  assert.equal(body.series['claude/5h'].length, 50_000);
+  assert.equal(body.series['claude/5h'].some((s) => s.errorCode === 'auth_expired_local'), false);
+  assert.deepEqual(body.authGaps['claude/5h'], [
+    { from: base + target * 180_000, to: base + (target + 1) * 180_000, reason: 'auth_expired_local' },
+  ]);
+});
+
+test('/api/samples: 確認送信の ok 点は通常の点と同じ shape で返り、authGaps は ok 点で分割される（§15.12）', async (t) => {
+  // 0..4 ローカル期限切れ、5 は確認送信の 200、6..9 ローカル期限切れ
+  const { base, db } = authDb(10, (i) => (i === 5 ? null : 'auth_expired_local'));
+  const baseUrl = await withServer(t, { db });
+  const body = await (await fetch(`${baseUrl}/api/samples?from=${base}&to=${base + 10 * 180_000}&claude=claude:1`)).json();
+  assert.deepEqual(body.authGaps['claude/5h'], [
+    { from: base, to: base + 5 * 180_000, reason: 'auth_expired_local' },
+    { from: base + 6 * 180_000, to: base + 10 * 180_000, reason: 'auth_expired_local' },
+  ]);
+  const okPoint = body.series['claude/5h'][5];
+  assert.deepEqual(Object.keys(okPoint).sort(), Object.keys(body.series['claude/5h'][4]).sort());
+  assert.deepEqual([okPoint.status, okPoint.errorCode, okPoint.usedPercent], ['ok', null, 10]);
+  // 期限超過フラグ等の追加フィールドはない
+  assert.equal(JSON.stringify(body).includes('probe'), false);
+});

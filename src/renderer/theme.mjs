@@ -87,6 +87,8 @@ export const COLORS = Object.freeze({
   muted: '#6B7280',
   gapFill: 'rgba(120,120,128,0.18)',
   gapBar: '#8E8E93',
+  /** 認証更新待ち（設計 §15.6）。欠測帯の上端バーに重ねる琥珀色 */
+  authBar: '#F59E0B',
   tooltipBg: 'rgba(31,41,51,0.92)',
   tooltipText: '#FFFFFF',
 });

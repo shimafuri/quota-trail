@@ -1,7 +1,7 @@
 // localhost HTTP サーバ（設計書 §6 / アカウントメニュー設計書 §3）
 // - 127.0.0.1 のみ bind、読み取り専用、CORS ヘッダは付けない
 // - 静的: src/renderer/* と src/shared/*（/shared/ 配下）
-// - API: /api/meta, /api/samples?from=&to=, /api/latest, /api/accounts
+// - API: /api/meta, /api/samples?from=&to=（Claude 認証区間 authGaps 付き、設計書 §15.6）, /api/latest, /api/accounts
 // - 実 ID は /api/account-identifiers だけが返し、process-scoped nonce と設定 gate を要求する
 import http from 'node:http';
 import crypto from 'node:crypto';
@@ -9,10 +9,14 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { findPort } from './lib/ports.mjs';
+import { computeAuthGaps } from '../shared/gaps.mjs';
 import * as logger from './logger.mjs';
 
 const HOST = '127.0.0.1';
 const MAX_POINTS_PER_SERIES = 50_000;
+/** 認証区間 overlay を返す系列（設計書 §15.6。Claude 3 キーのみ） */
+const AUTH_GAP_SERIES = ['claude/5h', 'claude/weekly', 'claude/weekly-fable'];
+const GAP_FACTOR = 2.5;
 
 /** 実 ID batch endpoint が要求するヘッダ名（アカウントメニュー設計書 §3.2）。 */
 const IDENTIFIER_TOKEN_HEADER = 'x-quota-trail-identifier-token';
@@ -283,6 +287,13 @@ export async function startServer({ db, readConfig, appRoot, onPort, getAutostar
       const accountIdsByProvider = selectors();
       if (!accountIdsByProvider) { sendJson(res, 400, { error: 'invalid account selector' }); return; }
       const raw = db.queryAllSeries({ from, to, accountIdsByProvider });
+      const now = Date.now();
+      // 認証区間は account filter 後・間引き前の生データから計算する（間引きで消えないように。設計書 §15.6）
+      /** @type {Record<string, any[]>} */
+      const authGaps = {};
+      for (const key of AUTH_GAP_SERIES) {
+        authGaps[key] = computeAuthGaps(Array.isArray(raw[key]) ? raw[key] : [], { from, to, now, factor: GAP_FACTOR });
+      }
       /** @type {Record<string, any[]>} */
       const series = {};
       let decimated = false;
@@ -290,7 +301,7 @@ export async function startServer({ db, readConfig, appRoot, onPort, getAutostar
         if (v.length > MAX_POINTS_PER_SERIES) decimated = true;
         series[k] = decimate(v);
       }
-      const payload = { series, now: Date.now() };
+      const payload = { series, authGaps, now };
       if (decimated) payload.decimated = true;
       sendJson(res, 200, payload);
       return;

@@ -140,3 +140,66 @@ function clipMerge(gaps, lo, hi) {
   }
   return out;
 }
+
+/**
+ * 認証更新待ちの区間（設計 §15.6）。
+ * @typedef {Object} AuthGap
+ * @property {number} from epoch ms
+ * @property {number} to epoch ms
+ * @property {'auth_expired_local'|'auth_expiring'|'auth_expired'} reason
+ */
+
+/** 認証区間として扱う error code と hover の理由（§15.6） */
+export const AUTH_GAP_REASON_LABELS = Object.freeze({
+  auth_expired_local: 'ローカル期限切れ',
+  auth_expiring: '期限間近',
+  auth_expired: '認証エラー',
+});
+
+/**
+ * 根拠のある認証区間だけを返す（`computeGaps()` の灰色帯に琥珀色の上端バーを重ねる用途）。
+ *
+ * - 開始は認証 error 行の `observedAt`
+ * - 終了は `min(次行の observedAt, observedAt + intervalSec × factor, now, to)`。次行が無くても同じ上限
+ * - 表示範囲に clip し、同じ理由で接する区間だけを merge する
+ * - `http_429` や行が無い区間は含めない（灰色のまま）。error 後の長い停止へ理由を延ばさない
+ *
+ * @param {Sample[]} samples observedAt 昇順（順不同でも内部でソートする）
+ * @param {{from:number,to:number,now?:number,factor?:number}} opts
+ * @returns {AuthGap[]}
+ */
+export function computeAuthGaps(samples, opts) {
+  const from = opts.from;
+  const to = opts.to;
+  const now = Number.isFinite(opts.now) ? /** @type {number} */ (opts.now) : to;
+  const factor = Number.isFinite(opts.factor) ? /** @type {number} */ (opts.factor) : 2.5;
+  /** @type {AuthGap[]} */
+  const out = [];
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return out;
+  const hi = Math.min(to, now);
+  if (!(hi > from)) return out;
+
+  const rows = (Array.isArray(samples) ? samples.slice() : []).filter(
+    (s) => s && Number.isFinite(s.observedAt),
+  );
+  rows.sort((a, b) => a.observedAt - b.observedAt);
+
+  for (let i = 0; i < rows.length; i++) {
+    const cur = rows[i];
+    const reason = cur.status === 'error' ? cur.errorCode : null;
+    if (!reason || !Object.prototype.hasOwnProperty.call(AUTH_GAP_REASON_LABELS, reason)) continue;
+    const next = rows[i + 1];
+    let end = cur.observedAt + intervalMs(cur) * factor;
+    if (next && next.observedAt < end) end = next.observedAt;
+    const a = Math.max(from, cur.observedAt);
+    const b = Math.min(hi, end);
+    if (!(b > a)) continue;
+    const tail = out[out.length - 1];
+    if (tail && tail.reason === reason && a <= tail.to) {
+      if (b > tail.to) tail.to = b;
+    } else {
+      out.push({ from: a, to: b, reason: /** @type {AuthGap['reason']} */ (reason) });
+    }
+  }
+  return out;
+}

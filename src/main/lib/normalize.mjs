@@ -11,7 +11,8 @@
  * @property {number|null} usedPercent  0..100（使用済み %）
  * @property {number|null} resetsAt     epoch ms
  * @property {'ok'|'error'} status
- * @property {string|null} errorCode
+ * @property {string|null} errorCode  'no_credentials' | 'auth_expired'（HTTP 401/403）| 'auth_expired_local'（ローカル期限切れ）
+ *   | 'auth_expiring'（30 秒以内に期限）| 'http_<status>' | 'network' | 'parse' | 'timeout' | 'window_absent'（設計書 §4.1 / §15.4）
  * @property {number} intervalSec
  */
 

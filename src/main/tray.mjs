@@ -1,43 +1,30 @@
-// トレイアイコンとメニュー（設計書 §8）
-import { Tray, Menu, nativeImage, shell } from 'electron';
+// トレイアイコンとメニュー（設計書 §8 / §15.6）
+import { Tray, Menu, nativeImage, shell, Notification } from 'electron';
 import path from 'node:path';
 import * as autostart from './autostart.mjs';
 import * as logger from './logger.mjs';
+import { buildTooltip } from './lib/tooltip.mjs';
 
-const ERROR_LABEL = {
-  no_credentials: '未ログイン',
-  auth_expired: '認証期限切れ',
-  window_absent: '枠なし',
-  timeout: 'タイムアウト',
-  network: '通信失敗',
-  parse: '応答不正',
-};
+export { buildTooltip } from './lib/tooltip.mjs';
 
 /**
- * @param {Record<string, import('./lib/normalize.mjs').Sample|null>} latest
- * @returns {string}
+ * Electron の OS 通知（設計書 §15.6）。monitor へ注入する。click でダッシュボードを開く。
+ * GC で click が失われないよう、表示中の通知への参照を閉じるまで保持する。
+ * @returns {{show:(notice:{title:string, body:string, onClick?:() => void}) => void}}
  */
-export function buildTooltip(latest) {
-  const fmt = (s) => {
-    if (!s) return '--';
-    if (s.status === 'ok' && s.usedPercent !== null) return `${Math.round(s.usedPercent)}%`;
-    return `-- (${ERROR_LABEL[s.errorCode ?? ''] ?? s.errorCode ?? 'error'})`;
+export function createElectronNotifier() {
+  const live = new Set();
+  return {
+    show({ title, body, onClick }) {
+      if (!Notification.isSupported()) return;
+      const n = new Notification({ title, body, silent: false });
+      live.add(n);
+      const release = () => { live.delete(n); };
+      n.on('click', () => { release(); onClick?.(); });
+      n.on('close', release);
+      n.show();
+    },
   };
-  const lines = ['quota-trail'];
-  lines.push(`Claude 5h ${fmt(latest['claude/5h'])} / W ${fmt(latest['claude/weekly'])}`);
-  lines.push(`Codex 5h ${fmt(latest['codex/5h'])} / W ${fmt(latest['codex/weekly'])}`);
-  const times = Object.values(latest).filter(Boolean).map((s) => s.observedAt);
-  if (times.length > 0) {
-    const d = new Date(Math.max(...times));
-    const hh = String(d.getHours()).padStart(2, '0');
-    const mm = String(d.getMinutes()).padStart(2, '0');
-    lines.push(`最終取得 ${hh}:${mm}`);
-  }
-  // 認証期限切れのときは回復方法を案内する
-  if (latest['claude/5h']?.errorCode === 'auth_expired') {
-    lines.push('Claude: Claude Code を一度起動すると回復します');
-  }
-  return lines.join('\n');
 }
 
 /**
@@ -45,10 +32,11 @@ export function buildTooltip(latest) {
  * @param {string} deps.appRoot
  * @param {() => string} deps.getUrl        ダッシュボード URL
  * @param {() => Record<string, any>} deps.getLatest
+ * @param {() => any} [deps.getClaudeAuth]  Claude 認証監視の公開状態（期限前の案内用）
  * @param {() => void} deps.onFetchNow
  * @param {() => void} deps.onQuit
  */
-export function createTray({ appRoot, getUrl, getLatest, getAccountDimensionAvailable = () => true, onFetchNow, onQuit }) {
+export function createTray({ appRoot, getUrl, getLatest, getAccountDimensionAvailable = () => true, getClaudeAuth = () => null, onFetchNow, onQuit }) {
   const icoPath = path.join(appRoot, 'assets', 'icon.ico');
   const pngPath = path.join(appRoot, 'assets', 'icon.png');
   let image = nativeImage.createFromPath(icoPath);
@@ -90,7 +78,7 @@ export function createTray({ appRoot, getUrl, getLatest, getAccountDimensionAvai
     tray,
     refresh() {
       try {
-        let tooltip = buildTooltip(getLatest());
+        let tooltip = buildTooltip(getLatest(), { claudeAuth: getClaudeAuth() });
         if (!getAccountDimensionAvailable()) {
           tooltip += '\nアカウント別表示は無効';
         }

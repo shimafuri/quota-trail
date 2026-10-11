@@ -1,20 +1,23 @@
 // Electron エントリ（設計書 §3 / §8）
-// single-instance lock → config → logger → db → 初回 identity/backfill → server → tray → scheduler
+// single-instance lock → config → logger → db → Claude 認証監視 → 初回 identity/backfill → server → tray → scheduler
 import { app, powerMonitor } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
 
 import * as logger from './logger.mjs';
-import { initConfig, readConfig, writeConfig } from './config.mjs';
+import { initConfig, readConfig, writeConfig, saveClaudeExpiredUsageProbeOff } from './config.mjs';
 import { openDb } from './db.mjs';
 import { startServer } from './server.mjs';
 import { createScheduler } from './scheduler.mjs';
 import { createAccountManager } from './account-manager.mjs';
-import { createTray } from './tray.mjs';
+import { createTray, createElectronNotifier } from './tray.mjs';
 import * as autostart from './autostart.mjs';
 import * as claude from './providers/claude.mjs';
 import * as codex from './providers/codex.mjs';
 import { resolveInitialIdentityWithinBudget } from './lib/startup-identity.mjs';
+import { createClaudeAuthMonitor } from './claude-auth-monitor.mjs';
+import { sleepInclusiveElapsedMs } from './lib/elapsed-clock.mjs';
+import { handleClaudePowerEvent } from './lib/power-events.mjs';
 
 /** @type {ReturnType<typeof openDb>|null} */
 let db = null;
@@ -25,6 +28,10 @@ let scheduler = null;
 /** @type {ReturnType<typeof createTray>|null} */
 let tray = null;
 let accountManager = null;
+/** @type {ReturnType<typeof createClaudeAuthMonitor>|null} */
+let claudeAuthMonitor = null;
+/** @type {ReturnType<typeof claude.createClaudeProvider>|null} */
+let claudeProvider = null;
 let quitting = false;
 /** will-quit で理由を出すための記録。'tray-menu' | 'second-instance' | 'signal:<name>' | 'power-shutdown' | 'unknown' */
 let quitReason = 'unknown';
@@ -96,10 +103,13 @@ function registerPowerMonitorLogging() {
     powerMonitor.on(evt, () => {
       if (evt === 'shutdown') quitReason = 'power-shutdown';
       logger.info('powerMonitor', { event: evt });
-      if (evt === 'resume' || evt === 'unlock-screen') {
-        // スリープ復帰・ロック解除後の最初のサンプルを即時取得する（設計書 §4.5）
-        void scheduler?.runNow();
-      }
+      // ロック中は OS 通知だけを保留する。監視と tick は止めない（H-002 / 設計書 §15.6）。
+      // suspend/resume は確認送信の予約に記録し、resume の gate 再評価を即時 tick より先に済ませる（§15.12）
+      handleClaudePowerEvent(evt, {
+        provider: claudeProvider,
+        monitor: claudeAuthMonitor,
+        runNow: () => scheduler?.runNow(),
+      });
     });
   }
   // on-ac / on-battery は darwin/win32 のみ（Linux では発火しないので登録を省く）
@@ -152,11 +162,41 @@ async function main() {
     logger.info('User-Agent を決定', { claude: claude.userAgent(), codex: codex.userAgent() });
   });
 
+  // Claude provider。起動 probe・scheduler・認証監視で同じインスタンスを使い、401 / 期限切れ latch と
+  // 期限超過後の確認送信の予算台帳を共有する（設計書 §15.4 / §15.12）。確認送信は config の
+  // claudeExpiredUsageProbe が 'once' のときだけで、429・期間/予算上限・台帳上限では設定を off に保存する。
+  claudeProvider = claude.createClaudeProvider({
+    readConfig,
+    logger,
+    elapsedNow: sleepInclusiveElapsedMs,
+    saveProbeOff: () => saveClaudeExpiredUsageProbeOff(),
+  });
+
+  // Claude 認証監視（設計書 §15.4 / §15.6）。30 秒ごとのローカル再読込のみで HTTP / DB は使わない。
+  claudeAuthMonitor = createClaudeAuthMonitor({
+    readSnapshot: () => claude.readCredentialSnapshot(),
+    provider: claudeProvider,
+    readConfig,
+    notifier: createElectronNotifier(),
+    openDashboard: () => tray?.openDashboard(),
+    onStatusChange: () => tray?.refresh(),
+    // blocked だった token が新 token に切り替わったときだけ、次の予定 tick を待たず即時 tick する
+    // （発注者指示 2026-10-03）。scheduler は後で作られるため module 内 let 変数を閉包で参照する
+    // （tray の onFetchNow と同じ形）。single-flight は scheduler.runNow() 自身が保証する
+    requestImmediateTick: () => { void scheduler?.runNow(); },
+  });
+  claudeAuthMonitor.start();
+
   // 初期画面の既定選択が別 account にならないよう、公開前に current/backfill を確定する。
   // profile が遅い・資格情報が無い場合でも 3 秒で unknown として先へ進む。
+  // Claude は期限 gate を通した profile/cache だけを参照し、usage は取得しない（設計書 §15.4）。
+  // 予算を超えた profile は通常 tick と共有されるため二重要求しない。
   const initialContext = { observedAt: Date.now(), intervalSec: cfg0.pollIntervalSec ?? 180 };
   const initialBatches = await Promise.all([
-    resolveInitialIdentityWithinBudget(claude.fetchClaudeSamples(initialContext), INITIAL_IDENTITY_TIMEOUT_MS),
+    resolveInitialIdentityWithinBudget(
+      claudeProvider.resolveInitialIdentity().then((identity) => ({ provider: 'claude', identity })),
+      INITIAL_IDENTITY_TIMEOUT_MS,
+    ),
     resolveInitialIdentityWithinBudget(codex.fetchCodexSamples(initialContext), INITIAL_IDENTITY_TIMEOUT_MS),
   ]);
   for (const [provider, batch] of [['claude', initialBatches[0]], ['codex', initialBatches[1]]]) {
@@ -187,6 +227,7 @@ async function main() {
     getUrl: () => server?.url ?? '',
     getLatest: () => (db ? db.latest({ accountIdsByProvider: accountManager?.currentAccountIds?.() }) : {}),
     getAccountDimensionAvailable: () => db?.accountDimensionAvailable !== false,
+    getClaudeAuth: () => claudeAuthMonitor?.publicStatus() ?? null,
     onFetchNow: () => { void scheduler?.runNow(); },
     onQuit: () => { quitReason = 'tray-menu'; quitting = true; app.quit(); },
   });
@@ -195,6 +236,8 @@ async function main() {
   scheduler = createScheduler({
     db,
     readConfig,
+    claudeProvider,
+    authObserver: claudeAuthMonitor,
     onSamples: (_samples, batches) => {
       for (const batch of batches) {
         accountManager?.observeBatch(batch);
@@ -220,6 +263,7 @@ app.on('quit', (_event, exitCode) => {
 
 app.on('will-quit', () => {
   if (lastAliveTimer) { clearInterval(lastAliveTimer); lastAliveTimer = null; }
+  try { claudeAuthMonitor?.stop(); } catch { /* noop */ }
   try { scheduler?.stop(); } catch { /* noop */ }
   try { tray?.destroy(); } catch { /* noop */ }
   try { void server?.close(); } catch { /* noop */ }

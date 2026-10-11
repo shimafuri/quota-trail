@@ -5,7 +5,7 @@
  * @module renderer/app
  */
 
-import { computeGaps } from '/shared/gaps.mjs';
+import { computeGaps, computeAuthGaps } from '/shared/gaps.mjs';
 import { formatDateTime, formatClockLabel } from '/shared/ticks.mjs';
 import { chooseAccountSelection, isAccountSelectionChange } from '/shared/account-selection.mjs';
 import {
@@ -64,6 +64,9 @@ const state = {
   data: {},
   /** @type {Record<string, Sample|null>} */
   latest: {},
+  /** サーバーが生データから計算した認証区間（設計書 §15.6）。無ければ null
+   * @type {Record<string, import('/shared/gaps.mjs').AuthGap[]|null>} */
+  authGaps: {},
   /** @type {Record<string, any>} */
   accountGroups: {},
   /** @type {Record<string, string|null>} */
@@ -81,7 +84,18 @@ for (const key of SERIES_KEYS) {
   state.panels[key] = { mode: 'line', points: true };
   state.data[key] = [];
   state.latest[key] = null;
+  state.authGaps[key] = null;
 }
+
+/** 認証区間 overlay を出す系列（Claude 3 系列のみ） */
+const AUTH_GAP_KEYS = new Set(['claude/5h', 'claude/weekly', 'claude/weekly-fable']);
+
+/** 選択中 account の最新行がこれらなら現在値に理由を出す（設計書 §15.6） */
+const AUTH_REASON_TEXT = Object.freeze({
+  auth_expired_local: '認証期限切れ',
+  auth_expiring: '期限間近',
+  auth_expired: '認証エラー',
+});
 
 /**
  * アカウントメニュー 1 つ分の controller。
@@ -288,6 +302,7 @@ async function fetchData() {
       rows.sort((left, right) => left.observedAt - right.observedAt);
       state.data[key] = rows;
       state.latest[key] = latestJson.series?.[key] ?? null;
+      state.authGaps[key] = Array.isArray(samplesJson.authGaps?.[key]) ? samplesJson.authGaps[key] : null;
     }
     state.decimated = Boolean(samplesJson.decimated);
     state.error = null;
@@ -309,6 +324,7 @@ function clearProvider(provider) {
     if (!key.startsWith(`${provider}/`)) continue;
     state.data[key] = [];
     state.latest[key] = null;
+    state.authGaps[key] = null;
     const panel = panels.find((candidate) => candidate.key === key);
     if (panel) panel.hover = null;
   }
@@ -1277,11 +1293,42 @@ function attachInteractions(panel) {
   });
 }
 
+/**
+ * 選択中 account の最新行が Claude の認証 error なら理由文字列を返す。
+ * @param {SeriesKey} key
+ * @returns {string|null}
+ */
+function authReasonFor(key) {
+  if (!AUTH_GAP_KEYS.has(key)) return null;
+  const latest = state.latest[key];
+  if (latest?.status !== 'error') return null;
+  return AUTH_REASON_TEXT[latest.errorCode ?? ''] ?? null;
+}
+
+/**
+ * 描画に渡す認証区間。サーバーの overlay を優先し、無ければ手元の samples から計算する。
+ * 間引き表示中で overlay が無いときは推測せず灰色だけにする（設計書 §15.6）。
+ * @param {SeriesKey} key
+ * @param {Sample[]} samples
+ * @param {{from:number,to:number}} range
+ * @param {number} now
+ * @returns {import('/shared/gaps.mjs').AuthGap[]|undefined}
+ */
+function authGapsFor(key, samples, range, now) {
+  if (!AUTH_GAP_KEYS.has(key)) return undefined;
+  const fromServer = state.authGaps[key];
+  if (Array.isArray(fromServer)) return fromServer;
+  if (state.decimated) return [];
+  return computeAuthGaps(samples, { from: range.from, to: range.to, now, factor: GAP_FACTOR });
+}
+
 /** @param {SeriesKey} key @returns {number|null} */
 function nextResetAtFor(key) {
   const latest = state.latest[key];
   if (latest?.status === 'ok' && Number.isFinite(latest.resetsAt)) return latest.resetsAt;
   if (key === 'claude/weekly-fable' && latest?.status === 'error') return null;
+  // Claude の認証更新待ち中は過去の ok 行からリセット予定を復活させない（設計書 §15.6）
+  if (authReasonFor(key) !== null) return null;
   for (const sample of [...(state.data[key] ?? [])].reverse()) {
     if (sample.status === 'ok' && Number.isFinite(sample.resetsAt)) return sample.resetsAt;
   }
@@ -1307,6 +1354,7 @@ function scheduleDraw() {
         to: range.to,
         now,
         gaps: computeGaps(samples, { from: range.from, to: range.to, now, factor: GAP_FACTOR }),
+        authGaps: authGapsFor(panel.key, samples, range, now),
         color: definition.color,
         legendLabel: definition.legend,
         mode: state.panels[panel.key].mode,
@@ -1331,8 +1379,22 @@ function renderHeader() {
     const dot = el('span', 'dot');
     dot.style.background = definition.color;
     item.append(dot, el('span', undefined, definition.short));
-    item.appendChild(el('b', undefined, sample?.status === 'ok' && sample.usedPercent != null ? `${Math.round(sample.usedPercent)}%` : '--'));
+    const authReason = authReasonFor(key);
+    const valueText = sample?.status === 'ok' && sample.usedPercent != null
+      ? `${Math.round(sample.usedPercent)}%`
+      : (authReason ?? '--');
+    item.appendChild(el('b', undefined, valueText));
     if (sample?.status !== 'ok') item.classList.add('is-error');
+    if (authReason !== null) {
+      item.classList.add('is-auth');
+      // 過去 account を選択中なら現在の認証状態と混同しないよう「最終記録時」と明示する
+      const group = state.accountGroups.claude;
+      const selected = state.selectedAccounts.claude;
+      const isCurrent = !group || !selected || group.currentAccountKey === selected;
+      item.title = isCurrent
+        ? `${authReason}: Claude Code を通常起動して認証を更新してください（回復しない場合は再ログイン）`
+        : `最終記録時: ${authReason}（現在の認証状態ではありません）`;
+    }
     const resetAt = nextResetAtFor(key);
     if (resetAt != null) item.appendChild(el('span', 'reset-suffix', ` · リセット ${formatClockLabel(resetAt, state.now)}`));
     if (Number.isFinite(sample?.observedAt)) newest = Math.max(newest, sample.observedAt);

@@ -8,6 +8,7 @@ decisions:
   - design.md v1（2026-09-07）: 却下。3 分の能動ポーリングで足りる。v2 候補
   - design-accounts.md v1（2026-09-22）: 却下。rollout の rate_limits と account ID の権威的な対応が確認できず、account 混在リスクが大きいため
   - design.md §14（2026-09-27）: 対象外。Claude OAuth usage の Fable 行には Codex rollout を使わない。従来の却下判断は維持
+  - design.md §15（2026-10-02）: 対象外。Claude の認証欠測の回復には使えず、Codex は現行経路を維持する。既存の却下理由と account 混在への懸念は変更しない
 ---
 
 ## 仮説

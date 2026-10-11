@@ -388,3 +388,38 @@ test('v1 縮退では listAccountIdentifiers が空配列を返す', { skip }, (
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('確認送信の正常値・混在窓・error を既存列で往復し、unknown の正常点を後から A へ移さない（§15.12）', { skip }, () => {
+  withDb((db) => {
+    const a = { provider: 'claude', uuid: '11111111-1111-4111-8111-111111111111', email: null, source: 'test', assurance: 'authoritative' };
+    const codex = (i) => ({ provider: 'codex', identity: null, samples: [sample(i, { provider: 'codex', usedPercent: 50 }), sample(i, { provider: 'codex', window: 'weekly', usedPercent: 60 })] });
+    const localError = (i, identity) => ({
+      provider: 'claude',
+      identity,
+      samples: ['5h', 'weekly', 'weekly-fable'].map((window) => sample(i, { window, usedPercent: null, resetsAt: null, status: 'error', errorCode: 'auth_expired_local' })),
+    });
+    // 期限前 A の正常点 → local error → 確認送信の 200（Fable なし = 混在窓）→ local error
+    db.recordPoll([{ provider: 'claude', identity: a, samples: normalizeClaude({ five_hour: { utilization: 30 }, seven_day: { utilization: 40 }, limits: [] }, { observedAt: t0, intervalSec: 180 }) }, codex(0)]);
+    db.recordPoll([localError(1, a), codex(1)]);
+    const probeRows = normalizeClaude({ five_hour: { utilization: 31 }, seven_day: { utilization: 41 }, limits: [] }, { observedAt: t0 + 2 * 180_000, intervalSec: 180 });
+    db.recordPoll([{ provider: 'claude', identity: a, samples: probeRows }, codex(2)]);
+    db.recordPoll([localError(3, a), codex(3)]);
+    // 権威 cache がない確認送信の 200 は unknown に保存
+    const unknownRows = normalizeClaude({ five_hour: { utilization: 77 }, seven_day: { utilization: 78 }, limits: [] }, { observedAt: t0 + 4 * 180_000, intervalSec: 180 });
+    db.recordPoll([{ provider: 'claude', identity: null, samples: unknownRows }, codex(4)]);
+    db.recordPoll([{ provider: 'claude', identity: a, samples: localError(5, a).samples }, codex(5)]);
+    assert.equal(db.count(), 6 * 5);
+
+    const aid = db.resolveAccountKey('claude', 'claude:1');
+    const series = db.queryAllSeries({ from: t0 - 1, to: t0 + 6 * 180_000, accountIdsByProvider: { claude: aid, codex: null } });
+    assert.deepEqual(series['claude/5h'].map((r) => `${r.status}:${r.errorCode}:${r.usedPercent}`), [
+      'ok:null:30', 'error:auth_expired_local:null', 'ok:null:31', 'error:auth_expired_local:null', 'error:auth_expired_local:null',
+    ]);
+    assert.deepEqual(series['claude/weekly-fable'].map((r) => r.errorCode), ['window_absent', 'auth_expired_local', 'window_absent', 'auth_expired_local', 'auth_expired_local']);
+    // 行の shape は通常の点と同じ（期限超過フラグの列はない）
+    assert.deepEqual(Object.keys(series['claude/5h'][2]).sort(), Object.keys(series['claude/5h'][0]).sort());
+    // unknown の正常点は A の系列に入らない
+    const unknownSeries = db.queryAllSeries({ from: t0 - 1, to: t0 + 6 * 180_000, accountIdsByProvider: { claude: null, codex: null } });
+    assert.deepEqual(unknownSeries['claude/5h'].map((r) => r.usedPercent), [77]);
+  });
+});

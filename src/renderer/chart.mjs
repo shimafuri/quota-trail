@@ -13,11 +13,13 @@ import {
   formatClockLabel,
   formatRemaining,
 } from '/shared/ticks.mjs';
+import { AUTH_GAP_REASON_LABELS } from '/shared/gaps.mjs';
 import { pastResets } from '/shared/resets.mjs';
 import { COLORS, FONTS } from './theme.mjs';
 
 /** @typedef {import('/shared/gaps.mjs').Sample} Sample */
 /** @typedef {import('/shared/gaps.mjs').Gap} Gap */
+/** @typedef {import('/shared/gaps.mjs').AuthGap} AuthGap */
 /** @typedef {{x:number,y:number,w:number,h:number}} Rect */
 
 export const PAD = Object.freeze({ left: 44, right: 12, top: 8, bottom: 28 });
@@ -42,7 +44,7 @@ function intervalMs(s) {
  * 凡例の行数を測る。
  * @param {CanvasRenderingContext2D} ctx
  * @param {number} cssW
- * @param {{symbol:'dot'|'band'|'dash'|'tag', color:string, text:string}[]} items
+ * @param {{symbol:'dot'|'band'|'authband'|'dash'|'tag', color:string, text:string}[]} items
  * @returns {number}
  */
 function legendLineCount(ctx, cssW, items) {
@@ -113,6 +115,7 @@ function valueToY(v, r) {
  * @property {number} to 表示範囲終了（ms）
  * @property {number} now 現在時刻（ms）
  * @property {Gap[]} gaps 欠測区間
+ * @property {AuthGap[]} [authGaps] 認証更新待ちの区間（Claude パネルのみ。未指定なら凡例にも出さない）
  * @property {string} color 系列色
  * @property {string} legendLabel 凡例の系列名
  * @property {'line'|'bar'} mode
@@ -146,6 +149,9 @@ export function drawChart(canvas, opts) {
   const legendItems = [
     { symbol: /** @type {'dot'} */ ('dot'), color: opts.color, text: opts.legendLabel },
     { symbol: /** @type {'band'} */ ('band'), color: COLORS.gapBar, text: '欠測' },
+    ...(Array.isArray(opts.authGaps)
+      ? [{ symbol: /** @type {'authband'} */ ('authband'), color: COLORS.authBar, text: '認証更新待ち' }]
+      : []),
     { symbol: /** @type {'dash'} */ ('dash'), color: opts.color, text: 'リセット' },
     { symbol: /** @type {'tag'} */ ('tag'), color: opts.color, text: 'リセット予定' },
   ];
@@ -158,6 +164,7 @@ export function drawChart(canvas, opts) {
 
   drawYAxis(ctx, r);
   drawGaps(ctx, r, opts.gaps || [], from, to);
+  drawAuthGaps(ctx, r, opts.authGaps || [], from, to);
   drawNowLine(ctx, r, opts.now, from, to);
   drawXAxis(ctx, r, cssW, from, to);
   drawResets(ctx, r, opts.samples || [], from, to, opts.color);
@@ -211,6 +218,29 @@ function drawGaps(ctx, r, gaps, from, to) {
     ctx.fillRect(x0, r.y, w, r.h);
     ctx.fillStyle = COLORS.gapBar;
     ctx.fillRect(x0, r.y, w, GAP_BAR_H);
+  }
+  ctx.restore();
+}
+
+/**
+ * 認証更新待ちの区間に琥珀色の上端バーを重ねる（設計 §15.6）。灰色帯は computeGaps 側で描く。
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {Rect} r
+ * @param {AuthGap[]} authGaps
+ * @param {number} from
+ * @param {number} to
+ */
+function drawAuthGaps(ctx, r, authGaps, from, to) {
+  if (!authGaps.length) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(r.x, r.y, r.w, r.h);
+  ctx.clip();
+  ctx.fillStyle = COLORS.authBar;
+  for (const g of authGaps) {
+    const x0 = timeToX(g.from, from, to, r);
+    const x1 = timeToX(g.to, from, to, r);
+    ctx.fillRect(x0, r.y, Math.max(1, x1 - x0), GAP_BAR_H);
   }
   ctx.restore();
 }
@@ -611,7 +641,7 @@ function drawSeries(ctx, r, opts, from, to) {
  * @param {number} cssW
  * @param {number} cssH
  * @param {number} lines
- * @param {{symbol:'dot'|'band'|'dash'|'tag', color:string, text:string}[]} items
+ * @param {{symbol:'dot'|'band'|'authband'|'dash'|'tag', color:string, text:string}[]} items
  */
 function drawLegend(ctx, cssW, cssH, lines, items) {
   ctx.font = FONTS.legend;
@@ -640,6 +670,11 @@ function drawLegend(ctx, cssW, cssH, lines, items) {
       ctx.fillRect(x, y - 4, 9, 8);
       ctx.fillStyle = COLORS.gapBar;
       ctx.fillRect(x, y - 4, 9, 2);
+    } else if (it.symbol === 'authband') {
+      ctx.fillStyle = COLORS.gapFill;
+      ctx.fillRect(x, y - 4, 9, 8);
+      ctx.fillStyle = COLORS.authBar;
+      ctx.fillRect(x, y - 4, 9, 3);
     } else if (it.symbol === 'tag') {
       ctx.fillStyle = it.color;
       roundRect(ctx, x, y - 4.5, 14, 9, 2);
@@ -698,6 +733,14 @@ export function nearestSample(samples, from, to, r, mouseX, maxDistPx = 40) {
 function drawTooltip(ctx, r, cssW, cssH, opts, from, to) {
   const hover = opts.hover;
   if (!hover) return;
+  // ok 点だけを選ぶ従来の tooltip より前に、認証区間の hit-test を置く（設計 §15.6）
+  const authGap = authGapAt(opts.authGaps || [], from, to, r, hover.x);
+  if (authGap) {
+    const label = AUTH_GAP_REASON_LABELS[authGap.reason] ?? '認証エラー';
+    const text = `認証更新待ち（${label}）  ${formatDateTime(authGap.from)} 〜 ${formatDateTime(authGap.to)}`;
+    drawTooltipBox(ctx, r, cssW, hover.x, Math.max(r.y + 30, hover.y), text);
+    return;
+  }
   const s = nearestSample(opts.samples || [], from, to, r, hover.x);
   if (!s || s.usedPercent == null) return;
   const px = timeToX(s.observedAt, from, to, r);
@@ -723,7 +766,37 @@ function drawTooltip(ctx, r, cssW, cssH, opts, from, to) {
 
   let text = `${formatDateTime(s.observedAt)}  ${s.usedPercent.toFixed(1)}%`;
   if (s.resetsAt != null) text += `  リセット ${formatDateTime(s.resetsAt)}`;
+  drawTooltipBox(ctx, r, cssW, px, py, text);
+}
 
+/**
+ * カーソル位置を含む認証区間を返す。
+ * @param {AuthGap[]} authGaps
+ * @param {number} from
+ * @param {number} to
+ * @param {Rect} r
+ * @param {number} mouseX CSS px
+ * @returns {AuthGap|null}
+ */
+export function authGapAt(authGaps, from, to, r, mouseX) {
+  if (mouseX < r.x || mouseX > r.x + r.w) return null;
+  const t = xToTime(mouseX, from, to, r);
+  for (const g of authGaps) {
+    if (t >= g.from && t <= g.to) return g;
+  }
+  return null;
+}
+
+/**
+ * tooltip の箱と文字を描く。
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {Rect} r
+ * @param {number} cssW
+ * @param {number} px アンカーの x
+ * @param {number} py アンカーの y
+ * @param {string} text
+ */
+function drawTooltipBox(ctx, r, cssW, px, py, text) {
   ctx.font = FONTS.tooltip;
   const tw = ctx.measureText(text).width;
   const bw = tw + 16;

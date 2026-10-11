@@ -9,6 +9,9 @@ import * as logger from './logger.mjs';
  * @property {number} port             HTTP サーバのポート。既定 47811
  * @property {number|null} retentionDays  保持日数。null = 無制限
  * @property {boolean} revealAccountIdentifiersInAccountMenu アカウントメニューを開いている間だけ実 ID を表示するか
+ * @property {boolean} claudeAuthNotifications Claude 認証の案内通知を出すか（設計書 §15.6）。false でも理由表示は続ける
+ * @property {number} claudeAuthNoticeLeadSec 期限の何秒前から案内するか。300–3600 に clamp、既定 600
+ * @property {'off'|'once'} claudeExpiredUsageProbe 期限超過後の usage 確認送信（設計書 §15.12）。'once' 以外は 'off'
  */
 
 /** @type {Config} */
@@ -17,12 +20,19 @@ export const DEFAULTS = Object.freeze({
   port: 47811,
   retentionDays: null,
   revealAccountIdentifiersInAccountMenu: true,
+  claudeAuthNotifications: true,
+  claudeAuthNoticeLeadSec: 600,
+  claudeExpiredUsageProbe: 'off',
 });
 
 /** 旧リリースの設定キー。正規化後の設定からは取り除く（設計書 §3.5）。 */
 export const LEGACY_REVEAL_KEY = 'revealAccountIdentifiers';
 
 export const MIN_POLL_INTERVAL_SEC = 30;
+
+/** Claude 認証の案内時刻の範囲（秒）。30 秒の送信余裕とは独立（設計書 §15.6） */
+export const MIN_CLAUDE_AUTH_NOTICE_LEAD_SEC = 300;
+export const MAX_CLAUDE_AUTH_NOTICE_LEAD_SEC = 3600;
 
 /** @type {string|null} */
 let configFile = null;
@@ -76,7 +86,24 @@ export function sanitizeConfig(raw) {
 
   // 新設定が未定義なら旧 revealAccountIdentifiers の値にかかわらず true とする（設計書 §3.5）。
   const revealAccountIdentifiersInAccountMenu = src.revealAccountIdentifiersInAccountMenu !== false;
-  return { pollIntervalSec, port, retentionDays, revealAccountIdentifiersInAccountMenu };
+
+  // boolean 以外（欠落・文字列など）は既定 true（設計書 §15.6）
+  const claudeAuthNotifications = typeof src.claudeAuthNotifications === 'boolean' ? src.claudeAuthNotifications : true;
+
+  // 有限の数値だけを整数化して 300–3600 に clamp。それ以外は 600
+  let claudeAuthNoticeLeadSec = src.claudeAuthNoticeLeadSec;
+  if (typeof claudeAuthNoticeLeadSec === 'number' && Number.isFinite(claudeAuthNoticeLeadSec)) {
+    claudeAuthNoticeLeadSec = Math.min(MAX_CLAUDE_AUTH_NOTICE_LEAD_SEC, Math.max(MIN_CLAUDE_AUTH_NOTICE_LEAD_SEC, Math.round(claudeAuthNoticeLeadSec)));
+  } else {
+    claudeAuthNoticeLeadSec = DEFAULTS.claudeAuthNoticeLeadSec;
+  }
+
+  // 'off' / 'once' のみ。欠落・不正値は安全側の 'off'（設計書 §15.6 / §15.12）
+  const claudeExpiredUsageProbe = src.claudeExpiredUsageProbe === 'once' ? 'once' : 'off';
+  return {
+    pollIntervalSec, port, retentionDays, revealAccountIdentifiersInAccountMenu,
+    claudeAuthNotifications, claudeAuthNoticeLeadSec, claudeExpiredUsageProbe,
+  };
 }
 
 /**
@@ -115,14 +142,33 @@ export function readConfig() {
  * @returns {Config}
  */
 export function writeConfig(patch) {
+  return writeConfigResult(patch).config;
+}
+
+/**
+ * 設定を書き戻し、保存できたかも返す。
+ * @param {Partial<Config>} patch
+ * @returns {{config:Config, saved:boolean}}
+ */
+function writeConfigResult(patch) {
   const next = sanitizeConfig({ ...(configFile && fs.existsSync(configFile) ? safeRead() : DEFAULTS), ...patch });
-  if (!configFile) return next;
+  if (!configFile) return { config: next, saved: false };
   try {
     fs.writeFileSync(configFile, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+    return { config: next, saved: true };
   } catch (e) {
     logger.warn('config.json を書けません', { error: String(e && e.message ? e.message : e) });
+    return { config: next, saved: false };
   }
-  return next;
+}
+
+/**
+ * 期限超過後の確認送信を設定上も off にする（429・期間/予算上限・台帳上限での停止。設計書 §15.12）。
+ * 保存に失敗しても呼び出し側のメモリ上の停止は解除しない。
+ * @returns {boolean} 保存できたら true
+ */
+export function saveClaudeExpiredUsageProbeOff() {
+  return writeConfigResult({ claudeExpiredUsageProbe: 'off' }).saved;
 }
 
 function safeRead() {

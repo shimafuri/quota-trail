@@ -101,6 +101,11 @@ body {
   color: var(--muted);
 }
 
+/* Claude の認証更新待ち（設計書 §15.6）。理由を琥珀色で示す */
+.current-value.is-auth b {
+  color: #B45309;
+}
+
 .current-value .reset-suffix {
   color: var(--muted);
   font-size: 10px;

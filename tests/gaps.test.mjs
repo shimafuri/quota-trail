@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { computeGaps } from '../src/shared/gaps.mjs';
+import { computeGaps, computeAuthGaps, AUTH_GAP_REASON_LABELS } from '../src/shared/gaps.mjs';
 
 const MIN = 60_000;
 const T0 = new Date(2026, 8, 7, 0, 0, 0, 0).getTime();
@@ -217,5 +217,124 @@ test('Fable の ok → window_absent → ok は欠測帯を残す', () => {
   ];
   assert.deepEqual(computeGaps(samples, { from: T0, to: T0 + 6 * MIN, now: T0 + 6 * MIN }), [
     { from: T0, to: T0 + 6 * MIN },
+  ]);
+});
+
+// ---------------------------------------------------------------- §15.6 認証区間 overlay
+
+/** @param {number} offsetMin @param {string} code @param {Partial<import('../src/shared/gaps.mjs').Sample>} [over] */
+function authErr(offsetMin, code, over = {}) {
+  return err(offsetMin, { errorCode: code, ...over });
+}
+
+test('computeAuthGaps: ローカル期限切れ・期限間近・401 をそれぞれの理由で返し、同じ理由で接する区間だけ merge する', () => {
+  const samples = [
+    ok(0),
+    authErr(3, 'auth_expiring'),
+    authErr(6, 'auth_expired_local'),
+    authErr(9, 'auth_expired_local'),
+    authErr(12, 'auth_expired'),
+    ok(15),
+  ];
+  const opts = { from: T0, to: T0 + 15 * MIN, now: T0 + 15 * MIN, factor: 2.5 };
+  assert.deepEqual(computeAuthGaps(samples, opts), [
+    { from: T0 + 3 * MIN, to: T0 + 6 * MIN, reason: 'auth_expiring' },
+    { from: T0 + 6 * MIN, to: T0 + 12 * MIN, reason: 'auth_expired_local' },
+    { from: T0 + 12 * MIN, to: T0 + 15 * MIN, reason: 'auth_expired' },
+  ]);
+  // 従来の computeGaps は不変（error 区間は前後の点まで灰色）
+  assert.deepEqual(computeGaps(samples, opts), [{ from: T0, to: T0 + 15 * MIN }]);
+});
+
+test('computeAuthGaps: 429・network・記録不在は含めない（灰色のまま）', () => {
+  const samples = [ok(0), err(3, { errorCode: 'http_429' }), err(6), ok(9), ok(30)];
+  const opts = { from: T0, to: T0 + 30 * MIN, now: T0 + 30 * MIN, factor: 2.5 };
+  assert.deepEqual(computeAuthGaps(samples, opts), []);
+  assert.ok(computeGaps(samples, opts).length > 0);
+});
+
+test('computeAuthGaps: error 後の長い停止は intervalSec × factor までしか延ばさない', () => {
+  // 0 分の認証 error のあと 10 時間記録なし
+  const samples = [authErr(0, 'auth_expired_local'), ok(600)];
+  const gaps = computeAuthGaps(samples, { from: T0 - 60 * MIN, to: T0 + 600 * MIN, now: T0 + 600 * MIN, factor: 2.5 });
+  assert.deepEqual(gaps, [{ from: T0, to: T0 + 7.5 * MIN, reason: 'auth_expired_local' }]);
+  // 灰色の欠測は停止区間全体に残る
+  const grey = computeGaps(samples, { from: T0 - 60 * MIN, to: T0 + 600 * MIN, now: T0 + 600 * MIN, factor: 2.5 });
+  assert.deepEqual(grey.at(-1), { from: T0 - 60 * MIN, to: T0 + 600 * MIN });
+});
+
+test('computeAuthGaps: 表示範囲・now に clip し、先頭外の行と未来を扱う', () => {
+  const samples = [authErr(-3, 'auth_expired_local'), authErr(0, 'auth_expired_local'), authErr(3, 'auth_expired_local')];
+  // 範囲より前の行も範囲内へ延びる分だけ使う。末尾は now で止める（未来は描かない）
+  assert.deepEqual(
+    computeAuthGaps(samples, { from: T0 - 1 * MIN, to: T0 + 60 * MIN, now: T0 + 4 * MIN, factor: 2.5 }),
+    [{ from: T0 - 1 * MIN, to: T0 + 4 * MIN, reason: 'auth_expired_local' }],
+  );
+  // 次行がない最後の行も intervalSec × factor が上限
+  assert.deepEqual(
+    computeAuthGaps(samples, { from: T0, to: T0 + 60 * MIN, now: T0 + 60 * MIN, factor: 2.5 }),
+    [{ from: T0, to: T0 + 10.5 * MIN, reason: 'auth_expired_local' }],
+  );
+  // 表示範囲が now より未来だけなら何も返さない
+  assert.deepEqual(computeAuthGaps(samples, { from: T0 + 61 * MIN, to: T0 + 90 * MIN, now: T0 + 60 * MIN }), []);
+  assert.deepEqual(computeAuthGaps(samples, { from: T0, to: T0 }), []);
+});
+
+test('computeAuthGaps: intervalSec が途中で変わっても行ごとの間隔で上限を決める', () => {
+  const samples = [
+    authErr(0, 'auth_expired_local', { intervalSec: 60 }),
+    authErr(10, 'auth_expired_local', { intervalSec: 600 }),
+  ];
+  assert.deepEqual(computeAuthGaps(samples, { from: T0, to: T0 + 60 * MIN, now: T0 + 60 * MIN, factor: 2.5 }), [
+    { from: T0, to: T0 + 2.5 * MIN, reason: 'auth_expired_local' },
+    { from: T0 + 10 * MIN, to: T0 + 35 * MIN, reason: 'auth_expired_local' },
+  ]);
+  assert.deepEqual(Object.keys(AUTH_GAP_REASON_LABELS), ['auth_expired_local', 'auth_expiring', 'auth_expired']);
+});
+
+// ---------------------------------------------------------------- §15.12 期限超過後の確認送信と認証帯
+
+test('computeAuthGaps: local error → probe の ok → local error で帯を分割し、ok 点を琥珀帯に含めない', () => {
+  const samples = [
+    authErr(0, 'auth_expired_local'),
+    authErr(3, 'auth_expired_local'),
+    ok(6), // 確認送信の 200（通常の点と同じ表示）
+    authErr(9, 'auth_expired_local'),
+    authErr(12, 'auth_expired_local'),
+  ];
+  const opts = { from: T0, to: T0 + 15 * MIN, now: T0 + 15 * MIN, factor: 2.5 };
+  assert.deepEqual(computeAuthGaps(samples, opts), [
+    { from: T0, to: T0 + 6 * MIN, reason: 'auth_expired_local' },
+    { from: T0 + 9 * MIN, to: T0 + 15 * MIN, reason: 'auth_expired_local' },
+  ]);
+});
+
+test('computeAuthGaps: probe の 401 は認証エラーの帯、429/network/timeout/parse と Fable の window_absent は灰色のみ', () => {
+  const probe401 = [authErr(0, 'auth_expired_local'), authErr(3, 'auth_expired'), authErr(6, 'auth_expired'), authErr(9, 'auth_expired')];
+  assert.deepEqual(computeAuthGaps(probe401, { from: T0, to: T0 + 12 * MIN, now: T0 + 12 * MIN, factor: 2.5 }), [
+    { from: T0, to: T0 + 3 * MIN, reason: 'auth_expired_local' },
+    { from: T0 + 3 * MIN, to: T0 + 12 * MIN, reason: 'auth_expired' },
+  ]);
+  for (const code of ['http_429', 'network', 'timeout', 'parse']) {
+    const samples = [authErr(0, 'auth_expired_local'), err(3, { errorCode: code }), authErr(6, 'auth_expired_local')];
+    const opts = { from: T0, to: T0 + 9 * MIN, now: T0 + 9 * MIN, factor: 2.5 };
+    assert.deepEqual(computeAuthGaps(samples, opts), [
+      { from: T0, to: T0 + 3 * MIN, reason: 'auth_expired_local' },
+      { from: T0 + 6 * MIN, to: T0 + 9 * MIN, reason: 'auth_expired_local' },
+    ], code);
+    // 灰色の欠測は従来どおり
+    assert.deepEqual(computeGaps(samples, opts), [{ from: T0, to: T0 + 9 * MIN }], code);
+  }
+  const fable = [authErr(0, 'auth_expired_local', { window: 'weekly-fable' }), err(3, { window: 'weekly-fable', errorCode: 'window_absent' })];
+  assert.deepEqual(computeAuthGaps(fable, { from: T0, to: T0 + 6 * MIN, now: T0 + 6 * MIN, factor: 2.5 }), [
+    { from: T0, to: T0 + 3 * MIN, reason: 'auth_expired_local' },
+  ]);
+});
+
+test('computeAuthGaps: probe の ok の後に長い停止があっても記録不在を推測で塗らない（now 上限・clip は維持）', () => {
+  const samples = [authErr(0, 'auth_expired_local'), ok(3), authErr(300, 'auth_expired_local')];
+  assert.deepEqual(computeAuthGaps(samples, { from: T0, to: T0 + 400 * MIN, now: T0 + 301 * MIN, factor: 2.5 }), [
+    { from: T0, to: T0 + 3 * MIN, reason: 'auth_expired_local' },
+    { from: T0 + 300 * MIN, to: T0 + 301 * MIN, reason: 'auth_expired_local' },
   ]);
 });

@@ -1,12 +1,13 @@
 // 1 行 JSON のログ（設計書 §10）
 // userData/logs/quota-trail.log、1 MB でローテーション（1 世代）。
 // トークン・ヘッダは絶対に書かない（呼び出し側が渡さない前提だが、念のため既知のキーを落とす）。
+// 設計書 §15.6: token fingerprint・内部キー・CLI の raw 出力も防御として落とす。文字列中の sk-ant- token と SHA-256 hex も伏せる。
 import fs from 'node:fs';
 import path from 'node:path';
 
 const MAX_BYTES = 1024 * 1024;
-const SECRET_KEYS = /^(authorization|cookie|token|access_token|accessToken|refresh_token|refreshToken|apiKey|api_key|headers|credentials|account_id|accountId|account_uuid|accountUuid|email|emailAddress|id_token|sub|profile|nonce|identifierAccessToken|identifier_access_token)$/i;
-const PRIVATE_TEXT = /Bearer\s+[^\s"']+|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\b[^\s@]+@[^\s@]+\.[^\s@]+\b/ig;
+const SECRET_KEYS = /^(authorization|cookie|token|access_token|accessToken|refresh_token|refreshToken|apiKey|api_key|headers|credentials|account_id|accountId|account_uuid|accountUuid|email|emailAddress|id_token|sub|profile|nonce|identifierAccessToken|identifier_access_token|fingerprint|tokenFingerprint|token_fingerprint|credentialKey|credential_key|stdout|stderr|rawOutput|raw_output|cliOutput|cli_output)$/i;
+const PRIVATE_TEXT = /\bsk-ant-[A-Za-z0-9_-]+|\b[0-9a-f]{64}\b|Bearer\s+[^\s"']+|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\b[^\s@]+@[^\s@]+\.[^\s@]+\b/ig;
 
 /** @type {{ file: string|null, dir: string|null }} */
 const state = { file: null, dir: null };
