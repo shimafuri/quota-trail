@@ -89,6 +89,14 @@ export const COLORS = Object.freeze({
   gapBar: '#8E8E93',
   /** 認証更新待ち（設計 §15.6）。欠測帯の上端バーに重ねる琥珀色 */
   authBar: '#F59E0B',
+  /**
+   * 利用ポリシー改定の範囲（設計 §7.4）。系列色（テラコッタ・プラム・緑）とも欠測の灰色とも
+   * 色相が離れる青紫。発表は薄く、発効は濃く塗り分ける
+   */
+  policy: '#5B5FE0',
+  policyFillAnnounce: 'rgba(91,95,224,0.08)',
+  policyFillEffective: 'rgba(91,95,224,0.16)',
+  policyLabelBg: 'rgba(255,255,255,0.88)',
   tooltipBg: 'rgba(31,41,51,0.92)',
   tooltipText: '#FFFFFF',
 });

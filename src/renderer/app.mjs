@@ -8,6 +8,7 @@
 import { computeGaps, computeAuthGaps } from '/shared/gaps.mjs';
 import { formatDateTime, formatClockLabel } from '/shared/ticks.mjs';
 import { chooseAccountSelection, isAccountSelectionChange } from '/shared/account-selection.mjs';
+import { policyEventsForProvider } from '/shared/policy-events.mjs';
 import {
   ACCOUNT_DIMENSION_UNAVAILABLE_TEXT,
   IDENTIFIER_PREPARING_TEXT,
@@ -1361,6 +1362,7 @@ function scheduleDraw() {
         showPoints: state.panels[panel.key].points,
         hover: panel.hover,
         nextResetAt: nextResetAtFor(panel.key),
+        policyEvents: policyEventsForProvider(definition.provider),
       });
     }
   });

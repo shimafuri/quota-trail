@@ -15,12 +15,22 @@ import {
 } from '/shared/ticks.mjs';
 import { AUTH_GAP_REASON_LABELS } from '/shared/gaps.mjs';
 import { pastResets } from '/shared/resets.mjs';
+import {
+  POLICY_LEGEND_TEXT,
+  policyEventSpanX,
+  policyEventAt,
+  policyEventTooltipLines,
+  nextPolicyEventAfter,
+  policyAheadLabel,
+} from '/shared/policy-events.mjs';
 import { COLORS, FONTS } from './theme.mjs';
 
 /** @typedef {import('/shared/gaps.mjs').Sample} Sample */
 /** @typedef {import('/shared/gaps.mjs').Gap} Gap */
 /** @typedef {import('/shared/gaps.mjs').AuthGap} AuthGap */
+/** @typedef {import('/shared/policy-events.mjs').PolicyEvent} PolicyEvent */
 /** @typedef {{x:number,y:number,w:number,h:number}} Rect */
+/** @typedef {'dot'|'band'|'authband'|'dash'|'tag'|'policy'} LegendSymbol */
 
 export const PAD = Object.freeze({ left: 44, right: 12, top: 8, bottom: 28 });
 const LEGEND_LINE_H = 17;
@@ -31,6 +41,7 @@ const LINE_BREAK_FACTOR = 2.5;
 const TAG_H = 16;
 const TAG_PAD_X = 5;
 const TAG_RADIUS = 3;
+const TOOLTIP_LINE_H = 17;
 
 /**
  * @param {Sample} s
@@ -44,7 +55,7 @@ function intervalMs(s) {
  * 凡例の行数を測る。
  * @param {CanvasRenderingContext2D} ctx
  * @param {number} cssW
- * @param {{symbol:'dot'|'band'|'authband'|'dash'|'tag', color:string, text:string}[]} items
+ * @param {{symbol:LegendSymbol, color:string, text:string}[]} items
  * @returns {number}
  */
 function legendLineCount(ctx, cssW, items) {
@@ -122,6 +133,7 @@ function valueToY(v, r) {
  * @property {boolean} showPoints
  * @property {{x:number,y:number}|null} [hover] カーソル位置（CSS px、canvas 基準）
  * @property {number|null} [nextResetAt] 予定されているリセット時刻（ms）。無ければ null
+ * @property {ReadonlyArray<PolicyEvent>|null} [policyEvents] 利用ポリシー改定の範囲（Claude パネルのみ。未指定なら凡例にも出さない）
  */
 
 /**
@@ -154,6 +166,9 @@ export function drawChart(canvas, opts) {
       : []),
     { symbol: /** @type {'dash'} */ ('dash'), color: opts.color, text: 'リセット' },
     { symbol: /** @type {'tag'} */ ('tag'), color: opts.color, text: 'リセット予定' },
+    ...(Array.isArray(opts.policyEvents)
+      ? [{ symbol: /** @type {'policy'} */ ('policy'), color: COLORS.policy, text: POLICY_LEGEND_TEXT }]
+      : []),
   ];
   const lines = legendLineCount(ctx, cssW, legendItems);
   const r = plotRect(cssW, cssH, lines);
@@ -162,14 +177,24 @@ export function drawChart(canvas, opts) {
   const to = opts.to;
   if (!(to > from)) return r;
 
+  const policyEvents = opts.policyEvents || [];
   drawYAxis(ctx, r);
+  drawPolicyBands(ctx, r, policyEvents, from, to);
   drawGaps(ctx, r, opts.gaps || [], from, to);
   drawAuthGaps(ctx, r, opts.authGaps || [], from, to);
-  drawNowLine(ctx, r, opts.now, from, to);
+  const nowLabel = drawNowLine(ctx, r, opts.now, from, to);
   drawXAxis(ctx, r, cssW, from, to);
   drawResets(ctx, r, opts.samples || [], from, to, opts.color);
   drawSeries(ctx, r, opts, from, to);
-  drawNextReset(ctx, r, opts.nextResetAt ?? null, from, to, opts.now, opts.color, opts.samples || [], opts.mode);
+  const resetTag = drawNextReset(ctx, r, opts.nextResetAt ?? null, from, to, opts.now, opts.color, opts.samples || [], opts.mode);
+  drawPolicyLabels(ctx, r, policyEvents, {
+    from,
+    to,
+    now: opts.now,
+    samples: opts.samples || [],
+    mode: opts.mode,
+    occupied: [nowLabel, resetTag].filter((x) => x != null),
+  });
   drawFrame(ctx, r);
   drawLegend(ctx, cssW, cssH, lines, legendItems);
   if (opts.hover) drawTooltip(ctx, r, cssW, cssH, opts, from, to);
@@ -254,9 +279,10 @@ function drawAuthGaps(ctx, r, authGaps, from, to) {
  * @param {number} now
  * @param {number} from
  * @param {number} to
+ * @returns {Rect|null} 「現在」ラベルの矩形（後から描くラベルの衝突回避に使う）
  */
 function drawNowLine(ctx, r, now, from, to) {
-  if (!Number.isFinite(now) || now <= from || now >= to) return;
+  if (!Number.isFinite(now) || now <= from || now >= to) return null;
   const x = Math.round(timeToX(now, from, to, r)) + 0.5;
   ctx.save();
   ctx.beginPath();
@@ -284,6 +310,7 @@ function drawNowLine(ctx, r, now, from, to) {
   if (lx + w / 2 > r.x + r.w) lx = r.x + r.w - w / 2;
   ctx.fillText('現在', lx, r.y + 2);
   ctx.restore();
+  return { x: lx - w / 2, y: r.y + 2, w, h: 13 };
 }
 
 /**
@@ -399,10 +426,11 @@ function newestOkUsedPercent(samples) {
  * @param {string} color 系列色
  * @param {Sample[]} samples
  * @param {'line'|'bar'} mode
+ * @returns {Rect|null} 描いたタグの矩形（後から描くラベルの衝突回避に使う）
  */
 function drawNextReset(ctx, r, nextResetAt, from, to, now, color, samples, mode) {
-  if (nextResetAt == null || !Number.isFinite(nextResetAt) || nextResetAt < from) return;
-  if (newestOkUsedPercent(samples) === 0) return;
+  if (nextResetAt == null || !Number.isFinite(nextResetAt) || nextResetAt < from) return null;
+  if (newestOkUsedPercent(samples) === 0) return null;
 
   const already = nextResetAt < now;
   const drawColor = already ? COLORS.gapBar : color;
@@ -414,6 +442,8 @@ function drawNextReset(ctx, r, nextResetAt, from, to, now, color, samples, mode)
   ctx.rect(r.x, r.y, r.w, r.h);
   ctx.clip();
 
+  /** @type {Rect} */
+  let tag;
   if (nextResetAt <= to) {
     // 表示範囲内: 縦線 + 線の位置に左寄せしたタグ
     const x = timeToX(nextResetAt, from, to, r);
@@ -428,7 +458,7 @@ function drawNextReset(ctx, r, nextResetAt, from, to, now, color, samples, mode)
     ctx.globalAlpha = 1;
 
     const text = `${prefix} ${clock}`;
-    drawTag(ctx, r, {
+    tag = drawTag(ctx, r, {
       anchorX: x,
       align: 'left',
       arrow: false,
@@ -444,7 +474,7 @@ function drawNextReset(ctx, r, nextResetAt, from, to, now, color, samples, mode)
     const text = already
       ? `${prefix} ${clock}`
       : `${prefix} ${clock}（あと ${formatRemaining(nextResetAt - now)}）`;
-    drawTag(ctx, r, {
+    tag = drawTag(ctx, r, {
       anchorX: r.x + r.w,
       align: 'right',
       arrow: !already,
@@ -458,6 +488,7 @@ function drawNextReset(ctx, r, nextResetAt, from, to, now, color, samples, mode)
   }
 
   ctx.restore();
+  return tag;
 }
 
 /**
@@ -505,6 +536,7 @@ function tagCollisions(samples, mode, from, to, r, top, isBottom, left, w) {
  * @param {CanvasRenderingContext2D} ctx
  * @param {Rect} r
  * @param {{anchorX:number, align:'left'|'right', arrow:boolean, text:string, color:string, samples:Sample[], mode:'line'|'bar', from:number, to:number}} opt
+ * @returns {Rect} 描いたタグの矩形
  */
 function drawTag(ctx, r, opt) {
   ctx.font = FONTS.tag;
@@ -537,6 +569,157 @@ function drawTag(ctx, r, opt) {
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
   ctx.fillText(label, left + TAG_PAD_X, top + TAG_H / 2 + 0.5);
+  return { x: left, y: top, w, h: TAG_H };
+}
+
+/**
+ * 利用ポリシー改定の範囲を、プロットの上から下までの半透明の四角形で描く（設計 §7.4）。
+ * 時刻が不確かな範囲なので線ではなく面で示し、両端に細い線を引く。発表は薄い塗り + 破線、
+ * 発効は濃い塗り + 実線。範囲が狭すぎるときは `policyEventSpanX` が最小幅（3px）まで広げる。
+ * 系列より先に描く（背面）。ラベルは衝突回避のため `drawPolicyLabels` で後から描く。
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {Rect} r
+ * @param {ReadonlyArray<PolicyEvent>} events
+ * @param {number} from
+ * @param {number} to
+ */
+function drawPolicyBands(ctx, r, events, from, to) {
+  if (!events.length) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(r.x, r.y, r.w, r.h);
+  ctx.clip();
+  for (const ev of events) {
+    const span = policyEventSpanX(ev, from, to, r);
+    if (!span) continue;
+    const effective = ev.kind === 'effective';
+    ctx.fillStyle = effective ? COLORS.policyFillEffective : COLORS.policyFillAnnounce;
+    ctx.fillRect(span.x0, r.y, span.x1 - span.x0, r.h);
+    ctx.strokeStyle = COLORS.policy;
+    ctx.globalAlpha = 0.7;
+    ctx.lineWidth = 1;
+    ctx.setLineDash(effective ? [] : [3, 3]);
+    for (const x of [span.x0, span.x1]) {
+      // 端がプロットの外なら線は引かない（範囲が表示範囲をはみ出していることを示す）
+      if (x < r.x || x > r.x + r.w) continue;
+      const px = Math.round(x) + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(px, r.y);
+      ctx.lineTo(px, r.y + r.h);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+/**
+ * @param {Rect} a
+ * @param {Rect} b
+ */
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+
+/**
+ * 利用ポリシー改定のラベルを描く。範囲内のイベントは四角形の左端に「規約発表」「規約発効」、
+ * 範囲より右（未来側）にあるイベントは最も近い 1 件だけをプロット右端に小さな印と
+ * 「規約発効まで N 日 →」で示す（左に外れた過去のイベントは何も出さない）。
+ *
+ * 置き場所はプロット上端の 1 段目・2 段目から選ぶ。`drawNextReset` の流儀に合わせ、
+ * 先に描いたリセット予定タグ・「現在」ラベル・他の規約ラベル（`occupied`）と重なる段は避け、
+ * 残りはデータ点との衝突数（`tagCollisions`）が少ない段を選ぶ（同数なら 1 段目）。
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {Rect} r
+ * @param {ReadonlyArray<PolicyEvent>} events
+ * @param {{from:number, to:number, now:number, samples:Sample[], mode:'line'|'bar', occupied:Rect[]}} opt
+ */
+function drawPolicyLabels(ctx, r, events, opt) {
+  if (!events.length) return;
+  const { from, to, now, samples, mode } = opt;
+  const occupied = opt.occupied.slice();
+  // 1 段目は欠測・認証更新待ちの上端バー（GAP_BAR_H）を隠さない高さから始める
+  const rows = [r.y + GAP_BAR_H + 2, r.y + GAP_BAR_H + 4 + TAG_H];
+  ctx.font = FONTS.tag;
+
+  /**
+   * @param {number} left
+   * @param {number} w
+   * @returns {number} 採用した段の上端 y
+   */
+  const pickRow = (left, w) => {
+    let best = rows[0];
+    let bestScore = Infinity;
+    for (const top of rows) {
+      const rect = { x: left, y: top, w, h: TAG_H };
+      const hard = occupied.some((o) => rectsOverlap(o, rect)) ? 1000 : 0;
+      const score = hard + tagCollisions(samples, mode, from, to, r, top, false, left, w);
+      if (score < bestScore) {
+        bestScore = score;
+        best = top;
+      }
+    }
+    return best;
+  };
+
+  /**
+   * @param {string} text
+   * @param {number} left
+   * @param {number} top
+   * @param {number} w
+   */
+  const drawLabel = (text, left, top, w) => {
+    ctx.save();
+    ctx.fillStyle = COLORS.policyLabelBg;
+    roundRect(ctx, left, top, w, TAG_H, TAG_RADIUS);
+    ctx.fill();
+    ctx.strokeStyle = COLORS.policy;
+    ctx.globalAlpha = 0.6;
+    ctx.lineWidth = 1;
+    roundRect(ctx, left + 0.5, top + 0.5, w - 1, TAG_H - 1, TAG_RADIUS);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = COLORS.policy;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, left + TAG_PAD_X, top + TAG_H / 2 + 0.5);
+    ctx.restore();
+    occupied.push({ x: left, y: top, w, h: TAG_H });
+  };
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(r.x, r.y, r.w, r.h);
+  ctx.clip();
+  ctx.font = FONTS.tag;
+
+  for (const ev of events) {
+    const span = policyEventSpanX(ev, from, to, r);
+    if (!span) continue;
+    const w = ctx.measureText(ev.shortLabel).width + TAG_PAD_X * 2;
+    // 四角形の見えている左端に左寄せ。右にはみ出すなら右寄せに付け替える
+    let left = span.visX0 + 2;
+    if (left + w > r.x + r.w - 2) left = Math.max(r.x + 2, span.visX1 - 2 - w);
+    drawLabel(ev.shortLabel, left, pickRow(left, w), w);
+  }
+
+  const ahead = nextPolicyEventAfter(events, from, to);
+  if (ahead) {
+    const text = policyAheadLabel(ahead, now);
+    const markW = 3;
+    const w = ctx.measureText(text).width + TAG_PAD_X * 2;
+    const left = r.x + r.w - markW - 2 - w;
+    const top = pickRow(left, w + markW + 2);
+    ctx.save();
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = COLORS.policy;
+    ctx.fillRect(r.x + r.w - markW, top, markW, TAG_H);
+    ctx.restore();
+    drawLabel(text, left, top, w);
+  }
+  ctx.restore();
 }
 
 /**
@@ -641,7 +824,7 @@ function drawSeries(ctx, r, opts, from, to) {
  * @param {number} cssW
  * @param {number} cssH
  * @param {number} lines
- * @param {{symbol:'dot'|'band'|'authband'|'dash'|'tag', color:string, text:string}[]} items
+ * @param {{symbol:LegendSymbol, color:string, text:string}[]} items
  */
 function drawLegend(ctx, cssW, cssH, lines, items) {
   ctx.font = FONTS.legend;
@@ -679,6 +862,19 @@ function drawLegend(ctx, cssW, cssH, lines, items) {
       ctx.fillStyle = it.color;
       roundRect(ctx, x, y - 4.5, 14, 9, 2);
       ctx.fill();
+    } else if (it.symbol === 'policy') {
+      ctx.fillStyle = COLORS.policyFillEffective;
+      ctx.fillRect(x, y - 5, 9, 10);
+      ctx.save();
+      ctx.globalAlpha = 0.7;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x + 0.5, y - 5);
+      ctx.lineTo(x + 0.5, y + 5);
+      ctx.moveTo(x + 8.5, y - 5);
+      ctx.lineTo(x + 8.5, y + 5);
+      ctx.stroke();
+      ctx.restore();
     } else {
       ctx.save();
       ctx.globalAlpha = 0.7;
@@ -733,16 +929,24 @@ export function nearestSample(samples, from, to, r, mouseX, maxDistPx = 40) {
 function drawTooltip(ctx, r, cssW, cssH, opts, from, to) {
   const hover = opts.hover;
   if (!hover) return;
+  // 利用ポリシー改定の四角形の上なら、その説明を既存の吹き出しの下に追記する（設計 §7.4）
+  const insidePlotY = hover.y >= r.y && hover.y <= r.y + r.h;
+  const policy = insidePlotY ? policyEventAt(opts.policyEvents || [], from, to, r, hover.x) : null;
+  const policyLines = policy ? policyEventTooltipLines(policy) : [];
   // ok 点だけを選ぶ従来の tooltip より前に、認証区間の hit-test を置く（設計 §15.6）
   const authGap = authGapAt(opts.authGaps || [], from, to, r, hover.x);
   if (authGap) {
     const label = AUTH_GAP_REASON_LABELS[authGap.reason] ?? '認証エラー';
     const text = `認証更新待ち（${label}）  ${formatDateTime(authGap.from)} 〜 ${formatDateTime(authGap.to)}`;
-    drawTooltipBox(ctx, r, cssW, hover.x, Math.max(r.y + 30, hover.y), text);
+    drawTooltipBox(ctx, r, cssW, hover.x, Math.max(r.y + 30, hover.y), [text, ...policyLines]);
     return;
   }
   const s = nearestSample(opts.samples || [], from, to, r, hover.x);
-  if (!s || s.usedPercent == null) return;
+  if (!s || s.usedPercent == null) {
+    // 近くに点が無くても（未来側の発効など）四角形の上なら説明だけ出す
+    if (policyLines.length) drawTooltipBox(ctx, r, cssW, hover.x, Math.max(r.y + 30, hover.y), policyLines);
+    return;
+  }
   const px = timeToX(s.observedAt, from, to, r);
   const py = valueToY(s.usedPercent, r);
 
@@ -766,7 +970,7 @@ function drawTooltip(ctx, r, cssW, cssH, opts, from, to) {
 
   let text = `${formatDateTime(s.observedAt)}  ${s.usedPercent.toFixed(1)}%`;
   if (s.resetsAt != null) text += `  リセット ${formatDateTime(s.resetsAt)}`;
-  drawTooltipBox(ctx, r, cssW, px, py, text);
+  drawTooltipBox(ctx, r, cssW, px, py, [text, ...policyLines]);
 }
 
 /**
@@ -788,19 +992,20 @@ export function authGapAt(authGaps, from, to, r, mouseX) {
 }
 
 /**
- * tooltip の箱と文字を描く。
+ * tooltip の箱と文字を描く。複数行なら 1 行目の下に区切り線を引く（追記した説明と分けるため）。
  * @param {CanvasRenderingContext2D} ctx
  * @param {Rect} r
  * @param {number} cssW
  * @param {number} px アンカーの x
  * @param {number} py アンカーの y
- * @param {string} text
+ * @param {string[]} lines
  */
-function drawTooltipBox(ctx, r, cssW, px, py, text) {
+function drawTooltipBox(ctx, r, cssW, px, py, lines) {
   ctx.font = FONTS.tooltip;
-  const tw = ctx.measureText(text).width;
+  let tw = 0;
+  for (const line of lines) tw = Math.max(tw, ctx.measureText(line).width);
   const bw = tw + 16;
-  const bh = 22;
+  const bh = 22 + (lines.length - 1) * TOOLTIP_LINE_H;
   let bx = px + 10;
   if (bx + bw > cssW - 4) bx = px - 10 - bw;
   if (bx < 4) bx = 4;
@@ -814,7 +1019,19 @@ function drawTooltipBox(ctx, r, cssW, px, py, text) {
   ctx.fillStyle = COLORS.tooltipText;
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
-  ctx.fillText(text, bx + 8, by + bh / 2);
+  lines.forEach((line, i) => ctx.fillText(line, bx + 8, by + 11 + i * TOOLTIP_LINE_H));
+  if (lines.length > 1) {
+    ctx.save();
+    ctx.strokeStyle = COLORS.tooltipText;
+    ctx.globalAlpha = 0.25;
+    ctx.lineWidth = 1;
+    const sy = Math.round(by + 11 + TOOLTIP_LINE_H / 2) + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(bx + 8, sy);
+    ctx.lineTo(bx + bw - 8, sy);
+    ctx.stroke();
+    ctx.restore();
+  }
 }
 
 /**
