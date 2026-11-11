@@ -20,7 +20,7 @@
 - **Codex CLI を呼ぶたびに、その直後に `node scripts/codex-limits.mjs` を実行し、Codex の 5h limit と Weekly limit の残量・リセット時刻を Claude Code の出力（発注者への報告文）にそのまま含めること**（発注者指示 2026-09-04）。このスクリプトは `~/.codex/sessions` の最新 rollout から `rate_limits` を読むだけで Codex を呼ばない。rollout を書かない `codex exec --ephemeral` は使わないこと
 - Claude の weekly usage limit がリセットされたこと、または使用率が 80% 未満であることを確認できるまで、エマージェンシーモードを継続すること
 
-### 設計モデルの選択（Sol 既定、Astra は切り札）
+### 設計モデルの選択（Sol 既定、切り札はその都度選ぶ）
 
 - 設計・技術選定・高リスクな変更・最終レビューの既定担当は `gpt-6.1-sol`（reasoning effort: high）。2026-09-05 に Astra へ切り替えたが、2026-09-07 に 5h limit の消費速度が実用に耐えないため Sol 既定へ戻した（発注者指示 2026-09-07）。2026-10-11 に `gpt-6-sol` から `gpt-6.1-sol` へ移行した（発注者指示 2026-10-11。Codex CLI 0.159.2 で利用可能を確認。`gpt-6.1-astra` / `gpt-6.1-luna` は未提供のため `gpt-6-astra` / `gpt-6-luna` を継続）
 - **設計を Codex CLI へ依頼するたびに、先に Sol の利用可能性を確認すること**。確認手順は次のコマンド 1 回（ほぼトークンを消費しない。`--ephemeral` を付けないので直後に `node scripts/codex-limits.mjs` で利用枠も読める）:
@@ -30,14 +30,9 @@
   ```
 
   `ok` が返れば利用可能。`model is not supported` / `not found` / `requires a newer version of Codex` 等のエラーなら、Codex CLI の更新（`npm i -g @openai/codex@latest`。他プロジェクトの Codex 連携に影響するため発注者に確認する）を試みる
-- `gpt-6-astra` は既定では使わない**切り札**とする。Sol の設計・実装が受け入れ条件を満たさない、レビューで Sol では解決できない根本的な欠陥が見つかる、同じ論点で 2 回以上やり直している、など Sol で行き詰まったときだけ使う。Astra を使うときの reasoning effort は既定 low（難航時のみ medium 以上）
-- Astra を実際に呼ぶ前には、その都度次のコマンドで利用可能性を確認すること:
-
-  ```powershell
-  codex exec -m gpt-6-astra -s read-only -c model_reasoning_effort=low "「ok」とだけ返答してください。ツールは使わないでください。"
-  ```
-
-  `ok` が返れば利用可能。エラーが出たときは Sol での設計・レビューを継続する
+- **切り札は固定しない**（`gpt-6-astra` はもう切り札ではない。発注者指示 2026-11-12）。Sol の設計・実装が受け入れ条件を満たさない、レビューで Sol では解決できない根本的な欠陥が見つかる、同じ論点で 2 回以上やり直している、など Sol で行き詰まったときだけ切り札を使う
+- 切り札が必要になったら、**その時点で** ECI（Epoch Capabilities Index、https://epoch.ai/eci?view=graph&tab=release-date ）が最も高いモデルのうち、**サブスク枠に響かないもの**を選定する。参考として ARC-AGI-3 のリーダーボード（https://arcprize.org/leaderboard?sort=v3 ）も見る
+- 切り札を使う前に、**モデル名と reasoning effort を発注者に明示する**。選定の根拠（ECI の値と確認日、サブスク枠に響かないと判断した理由）も添える。Codex CLI 経由のモデルなら、その都度 `ok` だけを返させる確認コマンド（上の Sol と同じ形）で利用可能性を確かめる
 
 ## 設計仮説（docs/hypotheses/）
 
